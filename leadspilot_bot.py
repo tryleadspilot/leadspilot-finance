@@ -120,7 +120,8 @@ def init_db():
     db = get_db()
     if not db: return
     db.cursor().execute("""
-        CREATE TABLE IF NOT EXISTS wise_tx (
+        DROP TABLE IF EXISTS wise_tx;
+        CREATE TABLE wise_tx (
             id         TEXT PRIMARY KEY,
             date       DATE,
             amount_raw NUMERIC(14,4),
