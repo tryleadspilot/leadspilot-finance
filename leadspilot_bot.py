@@ -639,12 +639,12 @@ def weekly_report(client):
     personal_change = curr.get("personal",0) - prev.get("personal",0)
 
     msg  = f":bar_chart: *Weekly Report — {week_start} to {week_end}*\n\n"
-    msg += f"*Revenue:* ${curr.get('revenue',0):,.2f} ({curr.get('leads',0)} leads)"
+    msg += f"*Revenue:* {curr.get('revenue',0):,.2f} AUD ({curr.get('leads',0)} leads)"
     if rev_change != 0:
         icon = ":arrow_up:" if rev_change > 0 else ":arrow_down:"
         msg += f" {icon} ${abs(rev_change):,.0f} vs last week"
     msg += f"\n*Business spend:* ${curr.get('biz_exp',0):,.2f}\n"
-    msg += f"*Profit:* ${curr.get('profit',0):,.2f}\n"
+    msg += f"*Profit:* {curr.get('profit',0):,.2f} AUD\n"
     msg += f"*Margin:* {curr.get('margin',0):.1f}%"
     if margin_change != 0:
         icon = ":arrow_up:" if margin_change > 0 else ":arrow_down_small:"
@@ -706,7 +706,7 @@ def answer(q, client=None):
         for r in by_recip_all) or "  none"
 
     cust_text = "\n".join(
-        f"  {r[0]}: {r[1]} charges | LTV ${float(r[2]):,.2f} | {r[3]} to {r[4]}"
+        f"  {r[0]}: {r[1]} charges | LTV {float(r[2]):,.2f} AUD | {r[3]} to {r[4]}"
         for r in by_cust) or "  none"
 
     recent_text = "\n".join(
@@ -898,13 +898,13 @@ def startup(client):
         msg  = f"*LeadsPilot Finance Bot online* :white_check_mark:\n\n"
         msg += f"*Wise:* {w_count} transactions ({w_oldest} to {w_newest})\n"
         msg += f"*Fanbasis:* {f_count} transactions ({f_oldest} to {f_newest})\n"
-        msg += f"*All-time net revenue:* ${float(f_net or 0):,.2f}\n"
-        msg += f"*This month profit:* ${month.get('profit',0):,.2f} | Margin: {month.get('margin',0):.1f}%\n"
+        msg += f"*All-time net revenue:* {float(f_net or 0):,.2f} AUD\n"
+        msg += f"*This month profit:* {month.get('profit',0):,.2f} AUD | Margin: {month.get('margin',0):.1f}%\n"
         msg += "\n*Wise balances:*\n" + "\n".join(f"  - {b}" for b in bals)
         if by_cat:
             msg += "\n\n*All-time spending by category:*\n"
             for cat, total, cnt in by_cat:
-                msg += f"  - {cat}: ${float(total):,.2f}\n"
+                msg += f"  - {cat}: {float(total):,.2f} AUD\n"
         msg += latest_wise + latest_fb
         msg += "\n\nAsk me anything — profit, margin, LTV, spending, revenue."
         client.chat_postMessage(channel=CHANNEL_ID, text=msg)
