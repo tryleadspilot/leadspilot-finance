@@ -825,10 +825,49 @@ def worker(client):
         except Exception as e: log.error(f"worker: {e}")
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
+def register_wise_webhooks():
+    """Register Wise webhooks automatically on startup. Safe to run multiple times."""
+    try:
+        pid = get_pid()
+        webhook_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+        if not webhook_url:
+            log.warning("RAILWAY_PUBLIC_DOMAIN not set — skipping webhook registration")
+            return
+        if not webhook_url.startswith("http"):
+            webhook_url = f"https://{webhook_url}"
+
+        headers = {**wise_h(), "Content-Type": "application/json"}
+
+        # Check existing subscriptions first
+        r = requests.get(f"{WISE_BASE}/v3/profiles/{pid}/subscriptions", headers=headers, timeout=10)
+        existing = []
+        if r.status_code == 200:
+            existing = [s.get("trigger_on") for s in r.json()]
+        log.info(f"Existing Wise webhooks: {existing}")
+
+        for event, name in [
+            ("balances#update", "LeadsPilot Balance Updates"),
+            ("transfers#state-change", "LeadsPilot Transfer Changes")
+        ]:
+            if event in existing:
+                log.info(f"Webhook {event} already registered")
+                continue
+            payload = {
+                "name": name,
+                "trigger_on": event,
+                "delivery": {"version": "2.0.0", "url": f"{webhook_url}/webhook/wise"}
+            }
+            r = requests.post(f"{WISE_BASE}/v3/profiles/{pid}/subscriptions",
+                headers=headers, json=payload, timeout=10)
+            log.info(f"Register {event}: HTTP {r.status_code} — {r.text[:100]}")
+    except Exception as e:
+        log.error(f"register_wise_webhooks: {e}")
+
 def startup(client):
     try:
         client.chat_postMessage(channel=CHANNEL_ID,
             text="_LeadsPilot Finance Bot loading — syncing all data..._")
+        register_wise_webhooks()
 
         fb_count = sync_fanbasis()
         unknowns = sync_wise_all()
