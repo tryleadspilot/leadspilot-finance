@@ -354,9 +354,14 @@ def sync_wise_all():
             if not batch: break
             for tx in batch:
                 if tx.get("status") not in ("outgoing_payment_sent",): continue
-                raw  = float(tx.get("sourceValue") or tx.get("targetValue") or 0)
+                # Use sourceValue (what left your account) and sourceCurrency
+                raw  = float(tx.get("sourceValue") or 0)
                 cur  = tx.get("sourceCurrency","AUD")
-                usd  = to_usd(raw, cur)
+                # If target is USD use targetValue directly for accuracy
+                if tx.get("targetCurrency") == "USD":
+                    usd = float(tx.get("targetValue") or to_usd(raw, cur))
+                else:
+                    usd  = to_usd(raw, cur)
                 det  = tx.get("details") or {}
                 # Try to get real name from targetAccount
                 acct_id  = tx.get("targetAccount")
@@ -811,7 +816,7 @@ def scheduler(client):
 # ── WORKER ────────────────────────────────────────────────────────────────────
 def worker(client):
     while True:
-        time.sleep(900)
+        time.sleep(180)
         try:
             log.info("Background sync...")
             unknowns = sync_wise_all()
@@ -919,10 +924,55 @@ def fb_webhook():
     except Exception as e:
         log.error(f"fb webhook: {e}"); return jsonify({"status":"error"}), 500
 
-@flask_app.route("/webhook/wise", methods=["POST"])
+@flask_app.route("/webhook/wise", methods=["POST", "GET"])
 def wise_webhook():
-    # Wise webhooks not available for personal accounts — handled by polling
-    return jsonify({"status":"ok"}), 200
+    if request.method == "GET":
+        return jsonify({"status":"ok","message":"Wise webhook active"}), 200
+    try:
+        payload    = request.get_json(force=True) or {}
+        event_type = payload.get("event_type","unknown")
+        log.info(f"Wise webhook: {event_type}")
+        # balances#update fires on every card payment and bank transfer
+        if event_type == "balances#update":
+            threading.Thread(target=handle_wise_balance_update,
+                args=(payload,), daemon=True).start()
+        elif event_type == "transfers#state-change":
+            threading.Thread(target=handle_wise_transfer,
+                args=(payload,), daemon=True).start()
+        return jsonify({"status":"ok"}), 200
+    except Exception as e:
+        log.error(f"wise webhook: {e}")
+        return jsonify({"status":"error"}), 500
+
+def handle_wise_balance_update(payload):
+    """
+    balances#update fires on every debit/credit — card payments, transfers, fees.
+    We trigger a targeted sync to pick up the new transaction immediately.
+    """
+    try:
+        data = payload.get("data", {})
+        tx_type = data.get("transaction_type","")
+        if tx_type == "debit":
+            # New spending — sync immediately
+            log.info("Balance update (debit) — syncing now...")
+            unknowns = sync_wise_all()
+            if unknowns:
+                ask_new_unknowns(unknowns, slack_app.client)
+    except Exception as e:
+        log.error(f"handle_wise_balance_update: {e}")
+
+def handle_wise_transfer(payload):
+    """transfers#state-change fires when a bank transfer completes."""
+    try:
+        data  = payload.get("data", {})
+        state = data.get("current_state","")
+        if state == "outgoing_payment_sent":
+            log.info("Transfer completed — syncing now...")
+            unknowns = sync_wise_all()
+            if unknowns:
+                ask_new_unknowns(unknowns, slack_app.client)
+    except Exception as e:
+        log.error(f"handle_wise_transfer: {e}")
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False)
