@@ -293,7 +293,7 @@ def get_balances():
         c = b.get("amount",{}).get("currency","")
         if v > 0:
             usd = to_usd(v, c)
-            out.append(f"{c}: {v:,.2f}" + (f" (~${usd:,.0f} USD)" if c!="USD" else ""))
+            out.append(f"{c}: {v:,.2f}")
     return out
 
 def get_account_ids():
@@ -598,7 +598,8 @@ def period_summary(start, end):
         profit = revenue - biz_exp
         margin = (profit / revenue * 100) if revenue > 0 else 0
         return {"revenue": revenue, "leads": leads, "biz_exp": biz_exp,
-                "personal": personal, "profit": profit, "margin": margin}
+                "personal": personal, "profit": profit, "margin": margin,
+                "currency": "AUD"}
     except: return {}
 
 # ── REPORTS ───────────────────────────────────────────────────────────────────
@@ -610,9 +611,9 @@ def daily_report(client):
     by_cat = spending_by_category(today, today)
 
     msg  = f":sun_with_face: *Daily Report — {now.strftime('%B %d, %Y')}*\n\n"
-    msg += f"*Revenue today:* ${s.get('revenue',0):,.2f} ({s.get('leads',0)} leads)\n"
-    msg += f"*Business spend:* ${s.get('biz_exp',0):,.2f}\n"
-    msg += f"*Profit:* ${s.get('profit',0):,.2f} | Margin: {s.get('margin',0):.1f}%\n"
+    msg += f"*Revenue today:* {s.get('revenue',0):,.2f} AUD ({s.get('leads',0)} leads)\n"
+    msg += f"*Business spend:* {s.get('biz_exp',0):,.2f} AUD\n"
+    msg += f"*Profit:* {s.get('profit',0):,.2f} AUD | Margin: {s.get('margin',0):.1f}%\n"
     if by_cat:
         msg += "\n*Spending breakdown:*\n"
         for cat, total, cnt in by_cat:
@@ -697,11 +698,11 @@ def answer(q, client=None):
     bal_text = "\n".join(f"  {b}" for b in bals) or "  unavailable"
 
     cat_text = "\n".join(
-        f"  {r[0]}: ${float(r[1]):,.0f} ({r[2]} payments)"
+        f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]} payments)"
         for r in by_cat_all) or "  none"
 
     recip_text = "\n".join(
-        f"  {r[0]} [{r[3]}]: ${float(r[1]):,.0f} ({r[2]} payments)"
+        f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]} payments)"
         for r in by_recip_all) or "  none"
 
     cust_text = "\n".join(
@@ -709,11 +710,11 @@ def answer(q, client=None):
         for r in by_cust) or "  none"
 
     recent_text = "\n".join(
-        f"  {r[0]}: ${float(r[1]):,.0f} ({float(r[2]):,.0f} {r[3]}) -> {r[4]} [{r[5] or 'Unknown'}]"
+        f"  {r[0]}: {float(r[2]):,.2f} {r[3]} -> {r[4]} [{r[5] or 'Unknown'}]"
         for r in recent) or "  none"
 
     system = f"""You are the financial intelligence bot for LeadsPilot — Suleman's SMS lead gen business ($75/lead, painting contractors USA).
-Answer naturally and directly. Exact numbers. USD always. Calculate anything asked.
+Answer naturally and directly. Exact numbers. AUD unless specified. Calculate anything asked.
 
 TODAY: {today} | This month: {month_start} to {today} | This week: {week_start} to {today}
 
@@ -829,10 +830,8 @@ def register_wise_webhooks():
     """Register Wise webhooks automatically on startup. Safe to run multiple times."""
     try:
         pid = get_pid()
-        webhook_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-        if not webhook_url:
-            log.warning("RAILWAY_PUBLIC_DOMAIN not set — skipping webhook registration")
-            return
+        webhook_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN",
+                          "leadspilot-finance-production.up.railway.app")
         if not webhook_url.startswith("http"):
             webhook_url = f"https://{webhook_url}"
 
