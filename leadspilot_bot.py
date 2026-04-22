@@ -387,22 +387,21 @@ def sync_statements():
                     amount_aud = abs(amount_val)
                     det = tx.get("details", {}) or {}
 
-                    # Get merchant name — card transactions have merchant in details
-                    merchant = (det.get("merchant") or
-                                det.get("senderName") or
-                                det.get("description") or "")
+                    # Safely extract merchant/recipient name — always a string
+                    def safe_str(v):
+                        if not v: return ""
+                        if isinstance(v, dict): return str(v.get("name") or v.get("accountHolderName") or "")
+                        return str(v).strip()
 
-                    # For transfers, get recipient name
-                    recip = det.get("recipient") or {}
-                    if isinstance(recip, dict):
-                        recip_name = recip.get("name") or ""
-                    else:
-                        recip_name = str(recip) if recip else ""
+                    merchant    = safe_str(det.get("merchant"))
+                    sender_name = safe_str(det.get("senderName"))
+                    description = safe_str(det.get("description"))
+                    recip_obj   = det.get("recipient") or {}
+                    recip_name  = safe_str(recip_obj) if isinstance(recip_obj, dict) else safe_str(recip_obj)
 
-                    raw_name = merchant or recip_name or det.get("type") or "Unknown"
-                    # Clean up raw name
+                    raw_name = merchant or recip_name or sender_name or description or safe_str(det.get("type")) or ""
                     raw_name = raw_name.strip()
-                    if not raw_name or raw_name == "Unknown": continue
+                    if not raw_name: continue
 
                     # Skip incoming/self transfers
                     clean_check, cat_check = lookup(raw_name)
