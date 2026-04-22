@@ -1,11 +1,7 @@
 """
-LeadsPilot Wise Bot — API ONLY, no CSV
-Uses:
-  1. /v1/transfers — bank transfers (PKR salaries, AUD wires)
-  2. /v1/profiles/{pid}/balance-statements — card transactions (Sendivo, Signal House etc)
-     BUT filtered to OUT only, COMPLETED only, with real merchant names
-  Both synced on startup + every 3 minutes
-  Webhooks: transfers#state-change registered via API on startup
+LeadsPilot Wise Bot — Uses Activity API
+/v1/profiles/{pid}/activities = exact same transaction feed you see in Wise app
+Every transaction: card, transfer, fee, conversion — all of it
 """
 import os, re, json, logging, requests, threading, time, ssl, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -27,9 +23,9 @@ PORT            = int(os.environ.get("PORT", 8080))
 EST             = ZoneInfo("America/New_York")
 WISE_BASE       = "https://api.wise.com"
 
-# ── ALL KNOWN RECIPIENTS ──────────────────────────────────────────────────────
 KNOWN = [
     ("Signal House SMS",                  "Signal House SMS",    "SMS Cost"),
+    ("Pay*Signal House",                  "Signal House SMS",    "SMS Cost"),
     ("Sendivo",                           "Sendivo",             "SMS Cost"),
     ("Fanbasis.com",                      "Fanbasis (Jacob)",    "Data Provider"),
     ("Fanbasis",                          "Fanbasis (Jacob)",    "Data Provider"),
@@ -46,57 +42,55 @@ KNOWN = [
     ("Annalyn Budejas",                   "Annalyn",             "Salary"),
     ("INTERACTIVE BROKERS LLC",           "Interactive Brokers", "Investment"),
     ("Usman Ahmed",                       "Usman Ahmed",         "Rent"),
-    ("Wahaj Khan",                        "Wahaj Khan",          "Loan/Personal"),  # cousin — loan out + pass-through for his clients
+    ("Wahaj Khan",                        "Wahaj Khan",          "Loan/Personal"),
     ("shayan amir khan",                  "Wahaj Khan",          "Loan/Personal"),
     ("MOEEZ MAZHAR",                      "Moeez Mazhar",        "Hardware"),
     ("Abdul Rehman Tahir",                "Abdul Rehman Tahir",  "Hardware"),
+    ("Pak Mac AC",                        "Pak Mac AC",          "Hardware"),
     ("Anthropic",                         "Anthropic",           "Software"),
     ("Claude",                            "Claude",              "Software"),
+    ("Claude.ai Subscription",            "Claude",              "Software"),
     ("HighLevel",                         "HighLevel",           "Software"),
+    ("Highlevel Inc.",                    "HighLevel",           "Software"),
+    ("Highlevel Agency Sub",              "HighLevel",           "Software"),
     ("Calendly",                          "Calendly",            "Software"),
     ("Opus Virtual Offices",              "Opus Virtual Offices","Software"),
+    ("Opus Virtual Offices Llc",          "Opus Virtual Offices","Software"),
     ("Zoom",                              "Zoom",                "Software"),
+    ("Zoom.com 888-799-9666",             "Zoom",                "Software"),
     ("N8n Cloud1",                        "N8n Cloud",           "Software"),
+    ("Paddle.net* N8n Cloud1",            "N8n Cloud",           "Software"),
     ("Slack",                             "Slack",               "Software"),
+    ("Slack T06094wlhcy",                 "Slack",               "Software"),
     ("Framer",                            "Framer",              "Software"),
-    ("Google",                            "Google",              "Software"),
+    ("Framer.com",                        "Framer",              "Software"),
+    ("Google",                            "Google Workspace",    "Software"),
+    ("Google Workspace_joinpilo",         "Google Workspace",    "Software"),
+    ("Google*Workspace Joinp",            "Google Workspace",    "Software"),
     ("Retell AI",                         "Retell AI",           "Software"),
+    ("Www.retellai.com",                  "Retell AI",           "Software"),
     ("Instantly",                         "Instantly",           "Software"),
     ("Whop Charan Invests",               "Whop",                "Software"),
-    ("Whop Rinip Ventures Ll",            "Whop Rinip",          "Business Other"),
+    ("Whop*Charan Invests",               "Whop",                "Software"),
     ("Grasshopper Group Llc",             "Grasshopper",         "Software"),
+    ("Grasshopper Group, Llc",            "Grasshopper",         "Software"),
+    ("Bizee.com",                         "Bizee",               "Software"),
+    ("Onlinejobs.ph",                     "OnlineJobs.ph",       "Software"),
+    ("Onlinejobsph",                      "OnlineJobs.ph",       "Software"),
+    ("Ow Mulebuy.com",                    "Mulebuy",             "Personal"),
+    ("Ow *Mulebuy.com",                   "Mulebuy",             "Personal"),
+    ("Whop Rinip Ventures Ll",            "Whop Rinip",          "Business Other"),
+    ("Whop*Rinip Ventures Ll",            "Whop Rinip",          "Business Other"),
     ("Saurabh Kumar",                     "Saurabh Kumar",       "Business Other"),
+    ("Saurabh",                           "Saurabh Kumar",       "Business Other"),
     ("Abdullah Habib (Minor)",            "Abdullah Habib",      "Business Other"),
     ("Inyxel Studios LLC",                "Inyxel Studios",      "Business Other"),
-    ("Onlinejobs.ph",                     "OnlineJobs.ph",       "Software"),
-    ("Bizee",                             "Bizee",               "Business Other"),
-    ("Divisible Inc",                     "Divisible Inc",       "SKIP"),
-    ("LEADS PILOT LLC",                   "LeadsPilot",          "SKIP"),
     ("Sp Thatonestreet",                  "Sp Thatonestreet",    "Business Other"),
-    ("Ow Mulebuy.com",                    "Ow Mulebuy",          "Software"),
     ("TransferWise",                      "TransferWise",        "Software"),
     ("Jonabelle Bayona Cahigas",          "Jonabelle",           "Unknown"),
     ("Gia Breeana Gentile",               "Gia Breeana",         "Unknown"),
-    ("Pay*Signal House",                  "Signal House SMS",    "SMS Cost"),
-    ("Claude.ai Subscription",            "Claude",              "Software"),
-    ("Whop*Charan Invests",               "Whop (course)",       "Software"),
-    ("Highlevel Inc.",                    "HighLevel",           "Software"),
-    ("Highlevel Agency Sub",              "HighLevel",           "Software"),
-    ("Opus Virtual Offices Llc",          "Opus Virtual Offices","Software"),
-    ("Www.retellai.com",                  "Retell AI",           "Software"),
-    ("Paddle.net* N8n Cloud1",            "N8n Cloud",           "Software"),
-    ("Zoom.com 888-799-9666",             "Zoom",                "Software"),
-    ("Google Workspace_joinpilo",         "Google Workspace",    "Software"),
-    ("Google*Workspace Joinp",            "Google Workspace",    "Software"),
-    ("Bizee.com",                         "Bizee",               "Software"),
-    ("Ow *Mulebuy.com",                   "Mulebuy",             "Personal"),
-    ("Slack T06094wlhcy",                 "Slack",               "Software"),
-    ("Pak Mac AC",                        "Pak Mac AC",          "Hardware"),
-    ("Framer.com",                        "Framer",              "Software"),
-    ("Whop*Rinip Ventures Ll",            "Whop Rinip Ventures", "Business Other"),
-    ("Grasshopper Group, Llc",            "Grasshopper Group",   "Software"),
-    ("Saurabh",                           "Saurabh Kumar",       "Business Other"),
-    ("Onlinejobsph",                      "OnlineJobs.ph",       "Software"),
+    ("Divisible Inc",                     "Divisible Inc",       "SKIP"),
+    ("LEADS PILOT LLC",                   "LeadsPilot",          "SKIP"),
 ]
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -151,8 +145,10 @@ def init_db():
             db.cursor().execute(
                 "INSERT INTO known(raw_name,clean_name,category) VALUES(%s,%s,%s) "
                 "ON CONFLICT(raw_name) DO NOTHING", (raw, clean, cat))
+            db.cursor().execute(
+                "INSERT INTO asked(raw_name) VALUES(%s) ON CONFLICT DO NOTHING", (raw,))
         except: pass
-    log.info("DB ready + recipients seeded")
+    log.info("DB ready + seeded")
 
 def lookup(raw_name):
     if not raw_name: return None, None
@@ -208,7 +204,7 @@ def insert_tx(tx_id, date, amount_aud, raw_name, clean_name, category, tx_type):
             "ON CONFLICT(id) DO UPDATE SET clean_name=EXCLUDED.clean_name, "
             "category=EXCLUDED.category, amount_aud=EXCLUDED.amount_aud",
             (tx_id, date, float(amount_aud), raw_name, clean_name, category, tx_type))
-    except Exception as e: log.error(f"insert_tx: {e}")
+    except Exception as e: log.error(f"insert_tx {tx_id}: {e}")
 
 # ── QUERIES ───────────────────────────────────────────────────────────────────
 def stats():
@@ -243,8 +239,7 @@ def by_recipient(start=None, end=None):
         p = []
         if start: q += " AND date>=%s"; p.append(start)
         if end:   q += " AND date<=%s"; p.append(end)
-        q += " GROUP BY COALESCE(clean_name,raw_name), COALESCE(category,'Unknown') "
-        q += "ORDER BY SUM(amount_aud) DESC LIMIT 30"
+        q += " GROUP BY COALESCE(clean_name,raw_name),COALESCE(category,'Unknown') ORDER BY SUM(amount_aud) DESC LIMIT 30"
         cur.execute(q, p); return cur.fetchall()
     except: return []
 
@@ -268,9 +263,9 @@ def period(start, end):
         cur.execute("""
             SELECT
               SUM(CASE WHEN category IN ('SMS Cost','Data Provider','Salary','Software','Business Other','Rent')
-                  THEN amount_aud ELSE 0 END) as biz,
-              SUM(CASE WHEN category='Personal' THEN amount_aud ELSE 0 END) as personal,
-              SUM(CASE WHEN category!='SKIP' THEN amount_aud ELSE 0 END) as total
+                  THEN amount_aud ELSE 0 END),
+              SUM(CASE WHEN category='Personal' THEN amount_aud ELSE 0 END),
+              SUM(CASE WHEN category!='SKIP' THEN amount_aud ELSE 0 END)
             FROM tx WHERE date>=%s AND date<=%s
         """, (start, end))
         r = cur.fetchone()
@@ -302,13 +297,6 @@ def get_balances():
         if v > 0: out.append(f"{c}: {v:,.2f}")
     return out
 
-def get_balance_ids():
-    pid = get_pid()
-    r = requests.get(f"{WISE_BASE}/v4/profiles/{pid}/balances",
-        headers=wise_h(), params={"types": "STANDARD"}, timeout=10)
-    r.raise_for_status()
-    return [(b["id"], b["amount"]["currency"]) for b in r.json() if b.get("id")]
-
 _name_cache = {}
 def resolve_name(account_id):
     if not account_id: return None
@@ -325,14 +313,110 @@ def resolve_name(account_id):
     except: pass
     return None
 
-def sync_transfers():
-    """Sync all bank transfers — returns new unknowns list."""
+def sync_activities():
+    """
+    Use /v1/profiles/{pid}/activities — this is exactly what Wise app shows.
+    Returns ALL activity: card payments, transfers, fees, conversions.
+    Has real merchant names exactly as shown in the app.
+    """
+    pid = get_pid()
+    unknowns = []
+    count = 0
+    
+    # Go back to Nov 2025
+    since = datetime(2025, 11, 1, tzinfo=timezone.utc).isoformat()
+    cursor = None
+    
+    while True:
+        try:
+            params = {"size": 100, "since": since}
+            if cursor: params["cursor"] = cursor
+            
+            r = requests.get(f"{WISE_BASE}/v1/profiles/{pid}/activities",
+                headers=wise_h(), params=params, timeout=20)
+            log.info(f"Activities: HTTP {r.status_code}")
+            
+            if r.status_code == 200:
+                data = r.json()
+                activities = data.get("activities", [])
+                log.info(f"  Got {len(activities)} activities")
+                if not activities: break
+                
+                for act in activities:
+                    # Only process money going OUT
+                    primary = act.get("primaryAmount", {})
+                    amount_val = float(primary.get("value", 0))
+                    currency   = primary.get("currency", "AUD")
+                    
+                    # Skip positives (incoming) and non-AUD for now
+                    if amount_val >= 0: continue
+                    if currency != "AUD": continue
+                    
+                    amount_aud = abs(amount_val)
+                    
+                    # Get the title — this is exactly what Wise shows you
+                    title = act.get("title", "")
+                    resource = act.get("resource", {}) or {}
+                    
+                    # For transfers, get real recipient name
+                    raw_name = title
+                    if act.get("type") == "TRANSFER":
+                        acct_id = resource.get("targetAccountId") or resource.get("accountId")
+                        if acct_id:
+                            resolved = resolve_name(acct_id)
+                            if resolved: raw_name = resolved
+                    
+                    if not raw_name: continue
+                    raw_name = str(raw_name).strip()
+                    
+                    # Skip internal/incoming
+                    clean_check, cat_check = lookup(raw_name)
+                    if cat_check == "SKIP": continue
+                    if raw_name in ("Wise", "TransferWise") and amount_val > 0: continue
+                    
+                    date_s = act.get("createdAt") or act.get("created", "")
+                    try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
+                    except: d = datetime.now().date()
+                    
+                    tx_id = str(act.get("id") or resource.get("id") or f"{date_s}_{amount_aud}")
+                    tx_type = act.get("type", "CARD")
+                    
+                    clean, cat = lookup(raw_name)
+                    if not clean and not was_asked(raw_name):
+                        unknowns.append((raw_name, amount_aud, d))
+                    
+                    insert_tx(tx_id, d, amount_aud, raw_name, clean or raw_name, cat, tx_type)
+                    count += 1
+                
+                # Pagination
+                next_cursor = data.get("nextCursor") or data.get("cursor")
+                if not next_cursor or len(activities) < 100: break
+                cursor = next_cursor
+                
+            else:
+                # Activity API not available — fall back to transfers + statements
+                log.warning(f"Activity API returned {r.status_code}: {r.text[:100]}")
+                log.info("Falling back to transfers + balance statements")
+                unknowns += sync_transfers_fallback()
+                unknowns += sync_statements_fallback()
+                break
+                
+        except Exception as e:
+            log.error(f"sync_activities: {e}")
+            unknowns += sync_transfers_fallback()
+            unknowns += sync_statements_fallback()
+            break
+    
+    log.info(f"Activities sync: {count} transactions, {len(unknowns)} new unknowns")
+    return unknowns
+
+def sync_transfers_fallback():
+    """Fallback: bank transfers via /v1/transfers"""
     pid = get_pid(); offset = 0; unknowns = []
     while True:
         try:
             r = requests.get(f"{WISE_BASE}/v1/transfers",
-                headers=wise_h(),
-                params={"profile": pid, "limit": 100, "offset": offset}, timeout=20)
+                headers=wise_h(), params={"profile": pid, "limit": 100, "offset": offset}, timeout=20)
             r.raise_for_status()
             batch = r.json() if isinstance(r.json(), list) else r.json().get("content", [])
             if not batch: break
@@ -355,24 +439,23 @@ def sync_transfers():
                 insert_tx(tx_id, d, amount, raw_name, clean or raw_name, cat, "TRANSFER")
             if len(batch) < 100: break
             offset += 100
-        except Exception as e: log.error(f"sync_transfers: {e}"); break
-    log.info(f"Transfers synced. {len(unknowns)} new unknowns.")
+        except Exception as e: log.error(f"transfers_fallback: {e}"); break
     return unknowns
 
-def sync_statements():
-    """
-    Sync card transactions via balance statements.
-    The statement includes ALL activity — we filter to DEBIT only.
-    Goes back to Nov 2025 in 89-day chunks.
-    The 'details.merchant' or 'details.description' field has the merchant name.
-    """
+def sync_statements_fallback():
+    """Fallback: card transactions via balance statements"""
     pid = get_pid()
     now   = datetime.now(timezone.utc)
-    start = datetime(2025, 11, 1, tzinfo=timezone.utc)  # full history from account start
+    start = datetime(2025, 11, 1, tzinfo=timezone.utc)
     unknowns = []
-
-    for bal_id, currency in get_balance_ids():
-        log.info(f"Syncing balance statements for {currency} balance {bal_id}")
+    try:
+        r = requests.get(f"{WISE_BASE}/v4/profiles/{pid}/balances",
+            headers=wise_h(), params={"types": "STANDARD"}, timeout=10)
+        r.raise_for_status()
+        balances = [(b["id"], b["amount"]["currency"]) for b in r.json() if b.get("id")]
+    except: return unknowns
+    
+    for bal_id, currency in balances:
         chunk_end = now
         while chunk_end > start:
             chunk_start = max(chunk_end - timedelta(days=89), start)
@@ -380,99 +463,41 @@ def sync_statements():
                 r = requests.get(
                     f"{WISE_BASE}/v1/profiles/{pid}/balance-statements/{bal_id}/statement.json",
                     headers=wise_h(),
-                    params={
-                        "currency":      currency,
-                        "intervalStart": chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                        "intervalEnd":   chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                        "type":          "COMPACT"
-                    }, timeout=25)
-                log.info(f"Statement {currency} {chunk_start.date()} to {chunk_end.date()}: HTTP {r.status_code}")
-                if r.status_code != 200:
-                    log.error(f"Statement error: {r.text[:100]}")
-                    break
-
-                txs = r.json().get("transactions", [])
-                log.info(f"  Got {len(txs)} statement transactions")
-
-                for tx in txs:
-                    # Only debits (money going OUT)
-                    tx_type_raw = tx.get("type", "").upper()
-                    amount_val  = float(tx.get("amount", {}).get("value", 0))
-
-                    # Debits are negative in balance statements
-                    if amount_val >= 0: continue
-                    # Skip fee-only entries
-                    if tx_type_raw in ("CONVERSION",): continue
-
-                    amount_aud = abs(amount_val)
+                    params={"currency": currency,
+                            "intervalStart": chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                            "intervalEnd":   chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                            "type": "COMPACT"}, timeout=25)
+                if r.status_code != 200: break
+                for tx in r.json().get("transactions", []):
+                    val = float(tx.get("amount", {}).get("value", 0))
+                    if val >= 0: continue
+                    amount = abs(val)
                     det = tx.get("details", {}) or {}
-
-                    # Safely extract merchant/recipient name — always a string
-                    def safe_str(v):
-                        if not v: return ""
-                        if isinstance(v, dict): return str(v.get("name") or v.get("accountHolderName") or "")
-                        return str(v).strip()
-
-                    merchant    = safe_str(det.get("merchant"))
-                    sender_name = safe_str(det.get("senderName"))
-                    description = safe_str(det.get("description"))
-                    recip_obj   = det.get("recipient") or {}
-                    recip_name  = safe_str(recip_obj) if isinstance(recip_obj, dict) else safe_str(recip_obj)
-
-                    raw_name = merchant or recip_name or sender_name or description or safe_str(det.get("type")) or ""
-                    raw_name = raw_name.strip()
+                    # Safely extract name
+                    parts = []
+                    for key in ["merchant","senderName","description"]:
+                        v = det.get(key)
+                        if v and isinstance(v, str) and v.strip():
+                            parts.append(v.strip()); break
+                    recip = det.get("recipient")
+                    if not parts and isinstance(recip, dict):
+                        n = recip.get("name") or recip.get("accountHolderName")
+                        if n: parts.append(str(n))
+                    raw_name = parts[0] if parts else ""
                     if not raw_name: continue
-
-                    # Skip incoming/self transfers
-                    clean_check, cat_check = lookup(raw_name)
-                    if cat_check == "SKIP": continue
-
+                    clean_c, cat_c = lookup(raw_name)
+                    if cat_c == "SKIP": continue
                     date_s = tx.get("date") or tx.get("createdAt", "")
                     try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
                     except: d = datetime.now().date()
-
-                    # Use referenceNumber as unique ID
-                    ext_id = str(tx.get("referenceNumber") or f"stmt_{bal_id}_{date_s}_{amount_aud}")
-
+                    ext_id = str(tx.get("referenceNumber") or f"stmt_{bal_id}_{date_s}_{amount}")
                     clean, cat = lookup(raw_name)
                     if not clean and not was_asked(raw_name):
-                        unknowns.append((raw_name, amount_aud, d))
-                    insert_tx(ext_id, d, amount_aud, raw_name, clean or raw_name, cat, "CARD")
-
-            except Exception as e:
-                log.error(f"statement chunk error: {e}")
+                        unknowns.append((raw_name, amount, d))
+                    insert_tx(ext_id, d, amount, raw_name, clean or raw_name, cat, "CARD")
+            except Exception as e: log.error(f"stmt chunk: {e}")
             chunk_end = chunk_start
-
-    log.info(f"Statements synced. {len(unknowns)} new unknowns.")
     return unknowns
-
-def sync_all():
-    u1 = sync_transfers()
-    u2 = sync_statements()
-    return u1 + u2
-
-# ── REGISTER WISE WEBHOOK ─────────────────────────────────────────────────────
-def register_webhook():
-    try:
-        pid = get_pid()
-        url = "https://leadspilot-finance-production.up.railway.app/webhook/wise"
-        h   = {**wise_h(), "Content-Type": "application/json"}
-        # Check existing
-        r = requests.get(f"{WISE_BASE}/v3/profiles/{pid}/subscriptions", headers=h, timeout=10)
-        existing = []
-        if r.status_code == 200:
-            existing = [s.get("trigger_on") for s in r.json()]
-        log.info(f"Existing webhooks: {existing}")
-        # Register transfers#state-change
-        if "transfers#state-change" not in existing:
-            r = requests.post(f"{WISE_BASE}/v3/profiles/{pid}/subscriptions",
-                headers=h, timeout=10,
-                json={"name": "LeadsPilot Transfers",
-                      "trigger_on": "transfers#state-change",
-                      "delivery": {"version": "2.0.0", "url": url}})
-            log.info(f"Register transfers#state-change: HTTP {r.status_code} — {r.text[:100]}")
-    except Exception as e:
-        log.error(f"register_webhook: {e}")
 
 # ── ASK / CONFIRM ─────────────────────────────────────────────────────────────
 def ask_unknowns(unknowns, client):
@@ -487,31 +512,26 @@ def ask_unknowns(unknowns, client):
         raw, aud, d = to_ask[0]
         msg = (f":question: *New transaction — who is this?*\n"
                f"*`{raw}`* — {aud:,.2f} AUD on {d}\n\n"
-               f"Just reply naturally — e.g. _{raw} is our SMS provider_")
+               f"Just reply naturally e.g. _{raw} is our SMS provider_")
     else:
-        msg = f":question: *{len(to_ask)} new recipients — who are these?*\n\n"
+        msg = f":question: *{len(to_ask)} new recipients:*\n\n"
         for raw, aud, d in to_ask[:20]:
             msg += f"• *`{raw}`* — {aud:,.2f} AUD ({d})\n"
         msg += "\nJust tell me who each one is naturally."
     try: client.chat_postMessage(channel=CHANNEL_ID, text=msg)
-    except Exception as e: log.error(f"ask_unknowns: {e}")
-
-def confirm_known(raw_name, clean_name, amount, d, client):
-    try:
-        client.chat_postMessage(channel=CHANNEL_ID,
-            text=f":white_check_mark: *New transaction:* {d} — {amount:,.2f} AUD to *{clean_name}*")
-    except: pass
+    except Exception as e: log.error(f"ask: {e}")
 
 # ── AI ────────────────────────────────────────────────────────────────────────
 def is_learning(text):
     low = text.lower()
     return (any(t in low for t in ["is our","is a ","is my ","is the ","salary",
-                                    "provider","expense","personal","rent","loan"])
-            and len(text.split()) < 30)
+                                    "provider","expense","personal","rent","loan",
+                                    "he is","she is","bought","build","software"])
+            and len(text.split()) < 35)
 
 def handle_learning(text):
-    system = """Extract recipient info. Return JSON only — no markdown:
-{"raw_name":"exact name as shown","clean_name":"human readable name","category":"category"}
+    system = """Extract recipient info from this message. Return JSON only:
+{"raw_name":"exact name as shown in Wise","clean_name":"human name","category":"category"}
 Categories: SMS Cost, Data Provider, Salary, Software, Personal, Investment, Rent, Loan/Personal, Hardware, Business Other
 If unclear: {"error":"unclear"}"""
     try:
@@ -525,7 +545,7 @@ If unclear: {"error":"unclear"}"""
             data = json.loads(r.json()["content"][0]["text"].strip())
             if "error" not in data and data.get("raw_name"):
                 learn(data["raw_name"], data["clean_name"], data["category"])
-                return (f":white_check_mark: Got it! *`{data['raw_name']}`* = "
+                return (f":white_check_mark: *`{data['raw_name']}`* = "
                         f"*{data['clean_name']}* ({data['category']}). All past transactions updated.")
     except: pass
     return None
@@ -535,8 +555,8 @@ def answer(q):
     try: bals = get_balances()
     except: bals = []
     count, oldest, newest = stats()
-    now   = datetime.now(EST)
-    today = now.date()
+    now         = datetime.now(EST)
+    today       = now.date()
     month_start = today.replace(day=1)
     week_start  = today - timedelta(days=today.weekday())
     month = period(month_start, today)
@@ -546,26 +566,33 @@ def answer(q):
     recips_month = by_recipient(month_start, today)
     last  = recent(40)
 
-    bal_text = "\n".join(f"  {b}" for b in bals) or "  unavailable"
-    cat_text = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]})" for r in cats) or "  none"
-    rec_text = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips) or "  none"
-    rec_month = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips_month) or "  none"
-    last_text = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]" for r in last) or "  none"
+    bal_text   = "\n".join(f"  {b}" for b in bals) or "  unavailable"
+    cat_text   = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]})" for r in cats) or "  none"
+    rec_text   = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips) or "  none"
+    rec_month  = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips_month) or "  none"
+    last_text  = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]" for r in last) or "  none"
 
-    system = f"""You are the Wise spending bot for LeadsPilot — Suleman's business (AUD account).
-Answer directly. All amounts in AUD. Be smart about name matching — e.g. "Signal House" matches "Pay*Signal House" and "Signal House SMS". "HighLevel" matches "Highlevel Inc." and "Highlevel Agency Sub". Always aggregate all variations of the same vendor together.
+    system = f"""You are the Wise spending bot for LeadsPilot — Suleman's AUD business account.
+Answer directly. All amounts in AUD.
+
+IMPORTANT NAME MATCHING RULES:
+- Signal House = Pay*Signal House = Signal House SMS — always combine these
+- HighLevel = Highlevel Inc. = Highlevel Agency Sub — always combine
+- Google = Google Workspace = Google*Workspace — always combine
+- Wahaj Khan = shayan amir khan — same person (cousin). Payments include: loan given, pass-through for his clients (NOT our money), MacBook advance. Not all Wahaj payments are our actual expense.
+- Fanbasis = Fanbasis.com = Fanbasis (Jacob) — same data provider
 
 TODAY: {today} | Month: {month_start} | Week: {week_start}
 
-BALANCES:
+BALANCES (live):
 {bal_text}
 
 DB: {count} transactions ({oldest} to {newest})
 
 THIS MONTH:
-  Business spend: {month.get('biz',0):,.2f} AUD
+  Business: {month.get('biz',0):,.2f} AUD
   Personal: {month.get('personal',0):,.2f} AUD
-  Total out: {month.get('total',0):,.2f} AUD
+  Total: {month.get('total',0):,.2f} AUD
 
 THIS WEEK:
   Business: {week.get('biz',0):,.2f} AUD
@@ -574,17 +601,14 @@ THIS WEEK:
 ALL-TIME BY CATEGORY:
 {cat_text}
 
-ALL-TIME BY RECIPIENT (IMPORTANT — match partial names e.g. Signal House = Pay*Signal House = Signal House SMS):
+ALL-TIME BY RECIPIENT:
 {rec_text}
 
 THIS MONTH BY RECIPIENT:
 {rec_month}
 
-RECENT TRANSACTIONS (newest first — use these for "last transaction" questions):
-{last_text}
-
-WAHAJ KHAN NOTE: Wahaj Khan (also shayan amir khan = same person, cousin) — some payments are loan, some are his client money we processed for him (pass-through, not our expense), some are MacBook we fronted. Not all Wahaj payments are our expense.
-SIGNAL HOUSE NOTE: Pay*Signal House = Signal House SMS = same vendor. Always add them together."""
+RECENT TRANSACTIONS (newest first):
+{last_text}"""
 
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
@@ -602,35 +626,24 @@ SIGNAL HOUSE NOTE: Pay*Signal House = Signal House SMS = same vendor. Always add
 def startup(client):
     try:
         client.chat_postMessage(channel=CHANNEL_ID,
-            text="_Wise Bot loading — syncing all transactions..._")
-        register_webhook()
-        # Mark all pre-known recipients as already asked so bot never asks about them
-        db = get_db()
-        if db:
-            for raw, clean, cat in KNOWN:
-                try:
-                    db.cursor().execute(
-                        "INSERT INTO asked(raw_name) VALUES(%s) ON CONFLICT DO NOTHING", (raw,))
-                except: pass
-        unknowns = sync_all()
+            text="_Wise Bot loading — syncing all transactions from Wise..._")
+        unknowns = sync_activities()
         count, oldest, newest = stats()
         bals  = get_balances()
         cats  = by_category()
         last  = recent(3)
-        latest = ""
-        if last:
-            latest = "\n*Recent transactions:*"
-            for r in last:
-                latest += f"\n  - {r[0]}: {float(r[1]):,.2f} AUD → *{r[2]}* [{r[3]}]"
-        msg  = f"*Wise Bot online* :white_check_mark:\n"
-        msg += f"*{count} transactions* ({oldest} to {newest})\n"
-        msg += "*Balances:*\n" + "\n".join(f"  - {b}" for b in bals)
+        msg   = f"*Wise Bot online* :white_check_mark:\n"
+        msg  += f"*{count} transactions* ({oldest} to {newest})\n"
+        msg  += "*Balances:*\n" + "\n".join(f"  - {b}" for b in bals)
         if cats:
             msg += "\n\n*All-time by category:*\n"
             for cat, total, cnt in cats:
                 msg += f"  - {cat}: {float(total):,.2f} AUD ({cnt})\n"
-        msg += latest
-        msg += "\n\nAsk me anything."
+        if last:
+            msg += "\n*Recent transactions:*\n"
+            for r in last:
+                msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD → *{r[2]}* [{r[3]}]\n"
+        msg += "\nAsk me anything."
         client.chat_postMessage(channel=CHANNEL_ID, text=msg)
         if unknowns:
             time.sleep(2)
@@ -644,7 +657,7 @@ def worker(client):
     while True:
         time.sleep(180)
         try:
-            unknowns = sync_all()
+            unknowns = sync_activities()
             if unknowns: ask_unknowns(unknowns, client)
         except Exception as e: log.error(f"worker: {e}")
 
@@ -657,7 +670,8 @@ def root(): return jsonify({"status": "LeadsPilot Wise Bot running"}), 200
 @flask_app.route("/health", methods=["GET"])
 def health():
     count, oldest, newest = stats()
-    return jsonify({"status": "ok", "transactions": count, "oldest": str(oldest), "newest": str(newest)})
+    return jsonify({"status": "ok", "transactions": count,
+                    "oldest": str(oldest), "newest": str(newest)})
 
 @flask_app.route("/webhook/wise", methods=["POST", "GET"])
 def wise_webhook():
@@ -666,12 +680,8 @@ def wise_webhook():
         payload    = request.get_json(force=True) or {}
         event_type = payload.get("event_type", "")
         log.info(f"Wise webhook: {event_type}")
-        if "transfer" in event_type or "balance" in event_type:
-            def handle_new():
-                u = sync_transfers()
-                u += sync_statements()
-                if u: ask_unknowns(u, slack_app.client)
-            threading.Thread(target=handle_new, daemon=True).start()
+        threading.Thread(target=lambda: ask_unknowns(sync_activities(), slack_app.client),
+            daemon=True).start()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         log.error(f"webhook: {e}"); return jsonify({"status": "error"}), 500
