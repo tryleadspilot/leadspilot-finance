@@ -368,7 +368,7 @@ def sync_statements():
     """
     pid = get_pid()
     now   = datetime.now(timezone.utc)
-    start = datetime(2025, 11, 1, tzinfo=timezone.utc)
+    start = datetime(2025, 11, 1, tzinfo=timezone.utc)  # full history from account start
     unknowns = []
 
     for bal_id, currency in get_balance_ids():
@@ -604,15 +604,24 @@ def startup(client):
         client.chat_postMessage(channel=CHANNEL_ID,
             text="_Wise Bot loading — syncing all transactions..._")
         register_webhook()
+        # Mark all pre-known recipients as already asked so bot never asks about them
+        db = get_db()
+        if db:
+            for raw, clean, cat in KNOWN:
+                try:
+                    db.cursor().execute(
+                        "INSERT INTO asked(raw_name) VALUES(%s) ON CONFLICT DO NOTHING", (raw,))
+                except: pass
         unknowns = sync_all()
         count, oldest, newest = stats()
         bals  = get_balances()
         cats  = by_category()
-        last  = recent(1)
+        last  = recent(3)
         latest = ""
         if last:
-            r = last[0]
-            latest = f"\n*Latest transaction:* {r[0]} — {float(r[1]):,.2f} AUD to *{r[2]}*"
+            latest = "\n*Recent transactions:*"
+            for r in last:
+                latest += f"\n  - {r[0]}: {float(r[1]):,.2f} AUD → *{r[2]}* [{r[3]}]"
         msg  = f"*Wise Bot online* :white_check_mark:\n"
         msg += f"*{count} transactions* ({oldest} to {newest})\n"
         msg += "*Balances:*\n" + "\n".join(f"  - {b}" for b in bals)
@@ -657,9 +666,12 @@ def wise_webhook():
         payload    = request.get_json(force=True) or {}
         event_type = payload.get("event_type", "")
         log.info(f"Wise webhook: {event_type}")
-        if "transfer" in event_type:
-            threading.Thread(target=lambda: ask_unknowns(sync_transfers(), slack_app.client),
-                daemon=True).start()
+        if "transfer" in event_type or "balance" in event_type:
+            def handle_new():
+                u = sync_transfers()
+                u += sync_statements()
+                if u: ask_unknowns(u, slack_app.client)
+            threading.Thread(target=handle_new, daemon=True).start()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         log.error(f"webhook: {e}"); return jsonify({"status": "error"}), 500
