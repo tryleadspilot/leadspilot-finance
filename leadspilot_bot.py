@@ -128,6 +128,8 @@ def init_db():
             id         TEXT PRIMARY KEY,
             date       DATE NOT NULL,
             amount_aud NUMERIC(14,4) NOT NULL,
+            amount_orig NUMERIC(14,4),
+            currency   TEXT DEFAULT 'AUD',
             raw_name   TEXT,
             clean_name TEXT,
             category   TEXT,
@@ -198,17 +200,31 @@ def mark_asked(raw_name):
             "INSERT INTO asked(raw_name) VALUES(%s) ON CONFLICT DO NOTHING", (raw_name,))
     except: pass
 
-def insert_tx(tx_id, date, amount_aud, raw_name, clean_name, category, tx_type):
+_fx_cache = {}
+def to_aud(amount, currency):
+    """Convert any currency to AUD."""
+    if not currency or currency == "AUD": return round(float(amount), 4)
+    if currency not in _fx_cache:
+        try:
+            r = requests.get(f"https://api.exchangerate-api.com/v4/latest/{currency}", timeout=6)
+            _fx_cache[currency] = r.json()["rates"]["AUD"]
+        except:
+            _fx_cache[currency] = {"USD":1.56,"GBP":1.97,"EUR":1.72,"CAD":1.14,
+                                    "PKR":0.0056,"PHP":0.027}.get(currency, 1.0)
+    return round(float(amount) * _fx_cache[currency], 4)
+
+def insert_tx(tx_id, date, amount_aud, raw_name, clean_name, category, tx_type, amount_orig=None, currency="AUD"):
     if category == "SKIP": return
     db = get_db()
     if not db: return
     try:
         db.cursor().execute(
-            "INSERT INTO tx(id,date,amount_aud,raw_name,clean_name,category,tx_type) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s) "
+            "INSERT INTO tx(id,date,amount_aud,amount_orig,currency,raw_name,clean_name,category,tx_type) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) "
             "ON CONFLICT(id) DO UPDATE SET clean_name=EXCLUDED.clean_name, "
             "category=EXCLUDED.category, amount_aud=EXCLUDED.amount_aud",
-            (tx_id, date, float(amount_aud), raw_name, clean_name, category, tx_type))
+            (tx_id, date, float(amount_aud), float(amount_orig or amount_aud),
+             currency, raw_name, clean_name, category, tx_type))
     except Exception as e: log.error(f"insert_tx {tx_id}: {e}")
 
 # ── QUERIES ───────────────────────────────────────────────────────────────────
@@ -255,7 +271,7 @@ def recent(n=40):
         cur = db.cursor()
         cur.execute(
             "SELECT date, amount_aud, COALESCE(clean_name,raw_name), "
-            "COALESCE(category,'Unknown'), tx_type FROM tx "
+            "COALESCE(category,'Unknown'), tx_type, COALESCE(currency,'AUD'), amount_orig FROM tx "
             "ORDER BY date DESC, synced_at DESC LIMIT %s", (n,))
         return cur.fetchall()
     except: return []
@@ -433,9 +449,12 @@ def sync_statements():
 
                 for tx in txs:
                     val = float(tx.get("amount", {}).get("value", 0))
+                    orig_currency = tx.get("amount", {}).get("currency", currency)
                     # Only debits (negative = money going out)
                     if val >= 0: continue
-                    amount = abs(val)
+                    amount_orig = abs(val)
+                    # Convert to AUD
+                    amount = to_aud(amount_orig, orig_currency) if orig_currency != "AUD" else amount_orig
 
                     det = tx.get("details", {}) or {}
 
@@ -471,7 +490,8 @@ def sync_statements():
                     clean, cat = lookup(raw_name)
                     if not clean and not was_asked(raw_name):
                         unknowns.append((raw_name, amount, d))
-                    insert_tx(ext_id, d, amount, raw_name, clean or raw_name, cat, "CARD")
+                    insert_tx(ext_id, d, amount, raw_name, clean or raw_name, cat, "CARD",
+                              amount_orig=amount_orig, currency=orig_currency)
                     total += 1
 
             except Exception as e:
@@ -557,7 +577,13 @@ def answer(q):
     cat_text   = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]})" for r in cats) or "  none"
     rec_text   = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips) or "  none"
     rec_month  = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips_month) or "  none"
-    last_text  = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]" for r in last) or "  none"
+    def fmt_tx(r):
+        cur = r[5] if len(r) > 5 else "AUD"
+        orig = r[6] if len(r) > 6 else None
+        if cur != "AUD" and orig:
+            return f"  {r[0]}: {float(r[1]):,.2f} AUD ({float(orig):,.2f} {cur}) -> {r[2]} [{r[3]}]"
+        return f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]"
+    last_text  = "\n".join(fmt_tx(r) for r in last) or "  none"
 
     system = f"""You are the Wise spending bot for LeadsPilot — Suleman's AUD business account.
 Answer directly. All amounts in AUD. Use EST timezone for date questions.
@@ -630,7 +656,12 @@ def startup(client):
         if last:
             msg += "\n*Recent transactions:*\n"
             for r in last:
-                msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD to *{r[2]}* [{r[3]}]\n"
+                cur = r[5] if len(r) > 5 else "AUD"
+                orig = r[6] if len(r) > 6 else None
+                if cur != "AUD" and orig:
+                    msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD ({float(orig):,.2f} {cur}) to *{r[2]}* [{r[3]}]\n"
+                else:
+                    msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD to *{r[2]}* [{r[3]}]\n"
         msg += "\nAsk me anything."
         client.chat_postMessage(channel=CHANNEL_ID, text=msg)
         if unknowns:
