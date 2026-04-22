@@ -46,7 +46,7 @@ KNOWN = [
     ("Annalyn Budejas",                   "Annalyn",             "Salary"),
     ("INTERACTIVE BROKERS LLC",           "Interactive Brokers", "Investment"),
     ("Usman Ahmed",                       "Usman Ahmed",         "Rent"),
-    ("Wahaj Khan",                        "Wahaj Khan",          "Loan/Personal"),
+    ("Wahaj Khan",                        "Wahaj Khan",          "Loan/Personal"),  # cousin — loan out + pass-through for his clients
     ("shayan amir khan",                  "Wahaj Khan",          "Loan/Personal"),
     ("MOEEZ MAZHAR",                      "Moeez Mazhar",        "Hardware"),
     ("Abdul Rehman Tahir",                "Abdul Rehman Tahir",  "Hardware"),
@@ -77,6 +77,26 @@ KNOWN = [
     ("TransferWise",                      "TransferWise",        "Software"),
     ("Jonabelle Bayona Cahigas",          "Jonabelle",           "Unknown"),
     ("Gia Breeana Gentile",               "Gia Breeana",         "Unknown"),
+    ("Pay*Signal House",                  "Signal House SMS",    "SMS Cost"),
+    ("Claude.ai Subscription",            "Claude",              "Software"),
+    ("Whop*Charan Invests",               "Whop (course)",       "Software"),
+    ("Highlevel Inc.",                    "HighLevel",           "Software"),
+    ("Highlevel Agency Sub",              "HighLevel",           "Software"),
+    ("Opus Virtual Offices Llc",          "Opus Virtual Offices","Software"),
+    ("Www.retellai.com",                  "Retell AI",           "Software"),
+    ("Paddle.net* N8n Cloud1",            "N8n Cloud",           "Software"),
+    ("Zoom.com 888-799-9666",             "Zoom",                "Software"),
+    ("Google Workspace_joinpilo",         "Google Workspace",    "Software"),
+    ("Google*Workspace Joinp",            "Google Workspace",    "Software"),
+    ("Bizee.com",                         "Bizee",               "Software"),
+    ("Ow *Mulebuy.com",                   "Mulebuy",             "Personal"),
+    ("Slack T06094wlhcy",                 "Slack",               "Software"),
+    ("Pak Mac AC",                        "Pak Mac AC",          "Hardware"),
+    ("Framer.com",                        "Framer",              "Software"),
+    ("Whop*Rinip Ventures Ll",            "Whop Rinip Ventures", "Business Other"),
+    ("Grasshopper Group, Llc",            "Grasshopper Group",   "Software"),
+    ("Saurabh",                           "Saurabh Kumar",       "Business Other"),
+    ("Onlinejobsph",                      "OnlineJobs.ph",       "Software"),
 ]
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -533,7 +553,7 @@ def answer(q):
     last_text = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]" for r in last) or "  none"
 
     system = f"""You are the Wise spending bot for LeadsPilot — Suleman's business (AUD account).
-Answer directly. All amounts in AUD.
+Answer directly. All amounts in AUD. Be smart about name matching — e.g. "Signal House" matches "Pay*Signal House" and "Signal House SMS". "HighLevel" matches "Highlevel Inc." and "Highlevel Agency Sub". Always aggregate all variations of the same vendor together.
 
 TODAY: {today} | Month: {month_start} | Week: {week_start}
 
@@ -554,14 +574,17 @@ THIS WEEK:
 ALL-TIME BY CATEGORY:
 {cat_text}
 
-ALL-TIME BY RECIPIENT:
+ALL-TIME BY RECIPIENT (IMPORTANT — match partial names e.g. Signal House = Pay*Signal House = Signal House SMS):
 {rec_text}
 
 THIS MONTH BY RECIPIENT:
 {rec_month}
 
-RECENT TRANSACTIONS:
-{last_text}"""
+RECENT TRANSACTIONS (newest first — use these for "last transaction" questions):
+{last_text}
+
+WAHAJ KHAN NOTE: Wahaj Khan (also shayan amir khan = same person, cousin) — some payments are loan, some are his client money we processed for him (pass-through, not our expense), some are MacBook we fronted. Not all Wahaj payments are our expense.
+SIGNAL HOUSE NOTE: Pay*Signal House = Signal House SMS = same vendor. Always add them together."""
 
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
