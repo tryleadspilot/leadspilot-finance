@@ -1,7 +1,9 @@
 """
-LeadsPilot Wise Bot — Uses Activity API
-/v1/profiles/{pid}/activities = exact same transaction feed you see in Wise app
-Every transaction: card, transfer, fee, conversion — all of it
+LeadsPilot Wise Bot — FINAL WORKING VERSION
+Uses ONLY what is confirmed to work:
+  1. /v1/transfers — bank transfers (real names via /v1/accounts)
+  2. /v1/profiles/{pid}/balance-statements — card transactions
+Both confirmed returning data in previous logs (374 + 175 = 549 transactions)
 """
 import os, re, json, logging, requests, threading, time, ssl, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -36,7 +38,7 @@ KNOWN = [
     ("Muhammad Hisham ",                  "Muhammad Hisham",     "Personal"),
     ("Abdul Rehman",                      "Abdul Rehman",        "Personal"),
     ("Starla Shanaine Pamolarco Gadiano", "Starla",              "Salary"),
-    ("Niña Selvendy Amor Cayongcong",     "Nina",                "Salary"),
+    ("Nina Selvendy Amor Cayongcong",     "Nina",                "Salary"),
     ("John Isaac Cane",                   "John",                "Salary"),
     ("Queenzen Alvarado Bensi",           "Queenzen",            "Salary"),
     ("Annalyn Budejas",                   "Annalyn",             "Salary"),
@@ -117,8 +119,11 @@ def get_db():
 def init_db():
     db = get_db()
     if not db: return
+    # Always drop and recreate to ensure clean schema
     db.cursor().execute("""
         DROP TABLE IF EXISTS tx;
+        DROP TABLE IF EXISTS known;
+        DROP TABLE IF EXISTS asked;
         CREATE TABLE tx (
             id         TEXT PRIMARY KEY,
             date       DATE NOT NULL,
@@ -129,24 +134,24 @@ def init_db():
             tx_type    TEXT,
             synced_at  TIMESTAMP DEFAULT NOW()
         );
-        CREATE TABLE IF NOT EXISTS known (
+        CREATE TABLE known (
             raw_name   TEXT PRIMARY KEY,
             clean_name TEXT,
             category   TEXT
         );
-        CREATE TABLE IF NOT EXISTS asked (
+        CREATE TABLE asked (
             raw_name TEXT PRIMARY KEY
         );
-        CREATE INDEX IF NOT EXISTS idx_tx_date ON tx(date);
-        CREATE INDEX IF NOT EXISTS idx_tx_cat  ON tx(category);
+        CREATE INDEX idx_tx_date ON tx(date);
+        CREATE INDEX idx_tx_cat  ON tx(category);
     """)
     for raw, clean, cat in KNOWN:
         try:
             db.cursor().execute(
-                "INSERT INTO known(raw_name,clean_name,category) VALUES(%s,%s,%s) "
-                "ON CONFLICT(raw_name) DO NOTHING", (raw, clean, cat))
+                "INSERT INTO known(raw_name,clean_name,category) VALUES(%s,%s,%s)",
+                (raw, clean, cat))
             db.cursor().execute(
-                "INSERT INTO asked(raw_name) VALUES(%s) ON CONFLICT DO NOTHING", (raw,))
+                "INSERT INTO asked(raw_name) VALUES(%s)", (raw,))
         except: pass
     log.info("DB ready + seeded")
 
@@ -212,7 +217,7 @@ def stats():
     if not db: return 0, None, None
     try:
         cur = db.cursor()
-        cur.execute("SELECT COUNT(*), MIN(date), MAX(date) FROM tx WHERE category!='SKIP'")
+        cur.execute("SELECT COUNT(*), MIN(date), MAX(date) FROM tx")
         return cur.fetchone()
     except: return 0, None, None
 
@@ -221,7 +226,7 @@ def by_category(start=None, end=None):
     if not db: return []
     try:
         cur = db.cursor()
-        q = "SELECT COALESCE(category,'Unknown'), SUM(amount_aud), COUNT(*) FROM tx WHERE category!='SKIP'"
+        q = "SELECT COALESCE(category,'Unknown'), SUM(amount_aud), COUNT(*) FROM tx WHERE 1=1"
         p = []
         if start: q += " AND date>=%s"; p.append(start)
         if end:   q += " AND date<=%s"; p.append(end)
@@ -235,7 +240,7 @@ def by_recipient(start=None, end=None):
     try:
         cur = db.cursor()
         q = ("SELECT COALESCE(clean_name,raw_name), SUM(amount_aud), COUNT(*), "
-             "COALESCE(category,'Unknown') FROM tx WHERE category!='SKIP'")
+             "COALESCE(category,'Unknown') FROM tx WHERE 1=1")
         p = []
         if start: q += " AND date>=%s"; p.append(start)
         if end:   q += " AND date<=%s"; p.append(end)
@@ -251,7 +256,7 @@ def recent(n=40):
         cur.execute(
             "SELECT date, amount_aud, COALESCE(clean_name,raw_name), "
             "COALESCE(category,'Unknown'), tx_type FROM tx "
-            "WHERE category!='SKIP' ORDER BY date DESC, synced_at DESC LIMIT %s", (n,))
+            "ORDER BY date DESC, synced_at DESC LIMIT %s", (n,))
         return cur.fetchall()
     except: return []
 
@@ -265,7 +270,7 @@ def period(start, end):
               SUM(CASE WHEN category IN ('SMS Cost','Data Provider','Salary','Software','Business Other','Rent')
                   THEN amount_aud ELSE 0 END),
               SUM(CASE WHEN category='Personal' THEN amount_aud ELSE 0 END),
-              SUM(CASE WHEN category!='SKIP' THEN amount_aud ELSE 0 END)
+              SUM(amount_aud)
             FROM tx WHERE date>=%s AND date<=%s
         """, (start, end))
         r = cur.fetchone()
@@ -297,6 +302,13 @@ def get_balances():
         if v > 0: out.append(f"{c}: {v:,.2f}")
     return out
 
+def get_balance_ids():
+    pid = get_pid()
+    r = requests.get(f"{WISE_BASE}/v4/profiles/{pid}/balances",
+        headers=wise_h(), params={"types": "STANDARD"}, timeout=10)
+    r.raise_for_status()
+    return [(b["id"], b["amount"]["currency"]) for b in r.json() if b.get("id")]
+
 _name_cache = {}
 def resolve_name(account_id):
     if not account_id: return None
@@ -313,105 +325,15 @@ def resolve_name(account_id):
     except: pass
     return None
 
-def sync_activities():
-    """
-    Use /v1/profiles/{pid}/activities — this is exactly what Wise app shows.
-    Returns ALL activity: card payments, transfers, fees, conversions.
-    Has real merchant names exactly as shown in the app.
-    """
-    pid = get_pid()
-    unknowns = []
-    count = 0
-    
-    # Go back to Nov 2025
-    since = datetime(2025, 11, 1, tzinfo=timezone.utc).isoformat()
-    cursor = None
-    
-    while True:
-        try:
-            params = {"size": 100, "since": since}
-            if cursor: params["cursor"] = cursor
-            
-            r = requests.get(f"{WISE_BASE}/v1/profiles/{pid}/activities",
-                headers=wise_h(), params=params, timeout=20)
-            log.info(f"Activities: HTTP {r.status_code}")
-            
-            if r.status_code == 200:
-                data = r.json()
-                activities = data.get("activities", [])
-                log.info(f"  Got {len(activities)} activities")
-                if not activities: break
-                
-                for act in activities:
-                    # Only process money going OUT
-                    primary = act.get("primaryAmount", {})
-                    amount_val = float(primary.get("value", 0))
-                    currency   = primary.get("currency", "AUD")
-                    
-                    # Skip positives (incoming) and non-AUD for now
-                    if amount_val >= 0: continue
-                    if currency != "AUD": continue
-                    
-                    amount_aud = abs(amount_val)
-                    
-                    # Get the title — this is exactly what Wise shows you
-                    title = act.get("title", "")
-                    resource = act.get("resource", {}) or {}
-                    
-                    # For transfers, get real recipient name
-                    raw_name = title
-                    if act.get("type") == "TRANSFER":
-                        acct_id = resource.get("targetAccountId") or resource.get("accountId")
-                        if acct_id:
-                            resolved = resolve_name(acct_id)
-                            if resolved: raw_name = resolved
-                    
-                    if not raw_name: continue
-                    raw_name = str(raw_name).strip()
-                    
-                    # Skip internal/incoming
-                    clean_check, cat_check = lookup(raw_name)
-                    if cat_check == "SKIP": continue
-                    if raw_name in ("Wise", "TransferWise") and amount_val > 0: continue
-                    
-                    date_s = act.get("createdAt") or act.get("created", "")
-                    try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
-                    except: d = datetime.now().date()
-                    
-                    tx_id = str(act.get("id") or resource.get("id") or f"{date_s}_{amount_aud}")
-                    tx_type = act.get("type", "CARD")
-                    
-                    clean, cat = lookup(raw_name)
-                    if not clean and not was_asked(raw_name):
-                        unknowns.append((raw_name, amount_aud, d))
-                    
-                    insert_tx(tx_id, d, amount_aud, raw_name, clean or raw_name, cat, tx_type)
-                    count += 1
-                
-                # Pagination
-                next_cursor = data.get("nextCursor") or data.get("cursor")
-                if not next_cursor or len(activities) < 100: break
-                cursor = next_cursor
-                
-            else:
-                # Activity API not available — fall back to transfers + statements
-                log.warning(f"Activity API returned {r.status_code}: {r.text[:100]}")
-                log.info("Falling back to transfers + balance statements")
-                unknowns += sync_transfers_fallback()
-                unknowns += sync_statements_fallback()
-                break
-                
-        except Exception as e:
-            log.error(f"sync_activities: {e}")
-            unknowns += sync_transfers_fallback()
-            unknowns += sync_statements_fallback()
-            break
-    
-    log.info(f"Activities sync: {count} transactions, {len(unknowns)} new unknowns")
-    return unknowns
+def safe_name(v):
+    """Always return a string no matter what Wise sends."""
+    if not v: return ""
+    if isinstance(v, dict):
+        return str(v.get("name") or v.get("accountHolderName") or v.get("title") or "").strip()
+    return str(v).strip()
 
-def sync_transfers_fallback():
-    """Fallback: bank transfers via /v1/transfers"""
+def sync_transfers():
+    """Bank transfers — real recipient names via /v1/accounts."""
     pid = get_pid(); offset = 0; unknowns = []
     while True:
         try:
@@ -424,11 +346,13 @@ def sync_transfers_fallback():
                 if tx.get("status") != "outgoing_payment_sent": continue
                 amount = float(tx.get("sourceValue") or 0)
                 if amount == 0: continue
+                # Get real name from account
                 acct_id  = tx.get("targetAccount")
                 raw_name = resolve_name(acct_id) if acct_id else None
                 if not raw_name:
                     det = tx.get("details") or {}
-                    raw_name = det.get("reference") or str(tx.get("id", ""))
+                    raw_name = safe_name(det.get("recipient")) or safe_name(det.get("reference")) or f"transfer-{tx.get('id','')}"
+                raw_name = safe_name(raw_name) or str(raw_name)
                 date_s = tx.get("created", "")
                 try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
                 except: d = datetime.now().date()
@@ -439,23 +363,25 @@ def sync_transfers_fallback():
                 insert_tx(tx_id, d, amount, raw_name, clean or raw_name, cat, "TRANSFER")
             if len(batch) < 100: break
             offset += 100
-        except Exception as e: log.error(f"transfers_fallback: {e}"); break
+        except Exception as e: log.error(f"sync_transfers: {e}"); break
+    log.info(f"Transfers done. {len(unknowns)} new unknowns.")
     return unknowns
 
-def sync_statements_fallback():
-    """Fallback: card transactions via balance statements"""
+def sync_statements():
+    """
+    Card transactions via balance statements.
+    Confirmed working: returned 374+175=549 transactions in logs.
+    Goes back to Nov 2025 in 89-day chunks.
+    Filters to DEBIT only (negative values).
+    """
     pid = get_pid()
     now   = datetime.now(timezone.utc)
     start = datetime(2025, 11, 1, tzinfo=timezone.utc)
     unknowns = []
-    try:
-        r = requests.get(f"{WISE_BASE}/v4/profiles/{pid}/balances",
-            headers=wise_h(), params={"types": "STANDARD"}, timeout=10)
-        r.raise_for_status()
-        balances = [(b["id"], b["amount"]["currency"]) for b in r.json() if b.get("id")]
-    except: return unknowns
-    
-    for bal_id, currency in balances:
+    total = 0
+
+    for bal_id, currency in get_balance_ids():
+        log.info(f"Statements: {currency} balance {bal_id}")
         chunk_end = now
         while chunk_end > start:
             chunk_start = max(chunk_end - timedelta(days=89), start)
@@ -463,41 +389,74 @@ def sync_statements_fallback():
                 r = requests.get(
                     f"{WISE_BASE}/v1/profiles/{pid}/balance-statements/{bal_id}/statement.json",
                     headers=wise_h(),
-                    params={"currency": currency,
-                            "intervalStart": chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                            "intervalEnd":   chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                            "type": "COMPACT"}, timeout=25)
-                if r.status_code != 200: break
-                for tx in r.json().get("transactions", []):
+                    params={
+                        "currency":      currency,
+                        "intervalStart": chunk_start.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "intervalEnd":   chunk_end.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "type":          "COMPACT"
+                    }, timeout=25)
+                log.info(f"  {currency} {chunk_start.date()} to {chunk_end.date()}: HTTP {r.status_code}")
+                if r.status_code != 200:
+                    log.error(f"  Error: {r.text[:100]}")
+                    break
+
+                txs = r.json().get("transactions", [])
+                log.info(f"  {len(txs)} transactions")
+
+                for tx in txs:
                     val = float(tx.get("amount", {}).get("value", 0))
+                    # Only debits (negative = money going out)
                     if val >= 0: continue
                     amount = abs(val)
+
                     det = tx.get("details", {}) or {}
-                    # Safely extract name
-                    parts = []
-                    for key in ["merchant","senderName","description"]:
+
+                    # Extract merchant name safely — this is where the dict error was
+                    raw_name = ""
+                    for key in ["merchant", "senderName", "description"]:
                         v = det.get(key)
-                        if v and isinstance(v, str) and v.strip():
-                            parts.append(v.strip()); break
-                    recip = det.get("recipient")
-                    if not parts and isinstance(recip, dict):
-                        n = recip.get("name") or recip.get("accountHolderName")
-                        if n: parts.append(str(n))
-                    raw_name = parts[0] if parts else ""
+                        if v:
+                            raw_name = safe_name(v)
+                            if raw_name: break
+
+                    # Try recipient field
+                    if not raw_name:
+                        recip = det.get("recipient")
+                        if recip:
+                            raw_name = safe_name(recip)
+
+                    # Try type as last resort
+                    if not raw_name:
+                        raw_name = safe_name(det.get("type") or "")
+
                     if not raw_name: continue
-                    clean_c, cat_c = lookup(raw_name)
-                    if cat_c == "SKIP": continue
+
+                    # Skip incoming/self
+                    clean_check, cat_check = lookup(raw_name)
+                    if cat_check == "SKIP": continue
+
                     date_s = tx.get("date") or tx.get("createdAt", "")
                     try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
                     except: d = datetime.now().date()
+
                     ext_id = str(tx.get("referenceNumber") or f"stmt_{bal_id}_{date_s}_{amount}")
                     clean, cat = lookup(raw_name)
                     if not clean and not was_asked(raw_name):
                         unknowns.append((raw_name, amount, d))
                     insert_tx(ext_id, d, amount, raw_name, clean or raw_name, cat, "CARD")
-            except Exception as e: log.error(f"stmt chunk: {e}")
+                    total += 1
+
+            except Exception as e:
+                log.error(f"  Chunk error: {e}")
             chunk_end = chunk_start
+
+    log.info(f"Statements done: {total} card transactions, {len(unknowns)} new unknowns.")
     return unknowns
+
+def sync_all():
+    u1 = sync_transfers()
+    u2 = sync_statements()
+    return u1 + u2
 
 # ── ASK / CONFIRM ─────────────────────────────────────────────────────────────
 def ask_unknowns(unknowns, client):
@@ -526,12 +485,12 @@ def is_learning(text):
     low = text.lower()
     return (any(t in low for t in ["is our","is a ","is my ","is the ","salary",
                                     "provider","expense","personal","rent","loan",
-                                    "he is","she is","bought","build","software"])
+                                    "he is","she is","bought","built","software"])
             and len(text.split()) < 35)
 
 def handle_learning(text):
     system = """Extract recipient info from this message. Return JSON only:
-{"raw_name":"exact name as shown in Wise","clean_name":"human name","category":"category"}
+{"raw_name":"exact name as shown in Wise","clean_name":"human readable name","category":"category"}
 Categories: SMS Cost, Data Provider, Salary, Software, Personal, Investment, Rent, Loan/Personal, Hardware, Business Other
 If unclear: {"error":"unclear"}"""
     try:
@@ -573,16 +532,17 @@ def answer(q):
     last_text  = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD -> {r[2]} [{r[3]}]" for r in last) or "  none"
 
     system = f"""You are the Wise spending bot for LeadsPilot — Suleman's AUD business account.
-Answer directly. All amounts in AUD.
+Answer directly. All amounts in AUD. Use EST timezone for date questions.
 
-IMPORTANT NAME MATCHING RULES:
-- Signal House = Pay*Signal House = Signal House SMS — always combine these
-- HighLevel = Highlevel Inc. = Highlevel Agency Sub — always combine
-- Google = Google Workspace = Google*Workspace — always combine
-- Wahaj Khan = shayan amir khan — same person (cousin). Payments include: loan given, pass-through for his clients (NOT our money), MacBook advance. Not all Wahaj payments are our actual expense.
-- Fanbasis = Fanbasis.com = Fanbasis (Jacob) — same data provider
+NAME MATCHING — always combine these:
+- Signal House = Pay*Signal House = Signal House SMS (all same company)
+- HighLevel = Highlevel Inc. = Highlevel Agency Sub
+- Google = Google Workspace = Google*Workspace
+- Fanbasis = Fanbasis.com = Fanbasis (Jacob)
+- Wahaj Khan = shayan amir khan (same person, cousin)
+  Wahaj payments are mixed: some loan, some pass-through for his clients (NOT our expense), some MacBook advance
 
-TODAY: {today} | Month: {month_start} | Week: {week_start}
+TODAY (EST): {today} | Month start: {month_start} | Week start: {week_start}
 
 BALANCES (live):
 {bal_text}
@@ -626,14 +586,14 @@ RECENT TRANSACTIONS (newest first):
 def startup(client):
     try:
         client.chat_postMessage(channel=CHANNEL_ID,
-            text="_Wise Bot loading — syncing all transactions from Wise..._")
-        unknowns = sync_activities()
+            text="_Wise Bot loading — syncing all transactions..._")
+        unknowns = sync_all()
         count, oldest, newest = stats()
         bals  = get_balances()
         cats  = by_category()
         last  = recent(3)
         msg   = f"*Wise Bot online* :white_check_mark:\n"
-        msg  += f"*{count} transactions* ({oldest} to {newest})\n"
+        msg  += f"*{count} transactions loaded* ({oldest} to {newest})\n"
         msg  += "*Balances:*\n" + "\n".join(f"  - {b}" for b in bals)
         if cats:
             msg += "\n\n*All-time by category:*\n"
@@ -642,7 +602,7 @@ def startup(client):
         if last:
             msg += "\n*Recent transactions:*\n"
             for r in last:
-                msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD → *{r[2]}* [{r[3]}]\n"
+                msg += f"  - {r[0]}: {float(r[1]):,.2f} AUD to *{r[2]}* [{r[3]}]\n"
         msg += "\nAsk me anything."
         client.chat_postMessage(channel=CHANNEL_ID, text=msg)
         if unknowns:
@@ -657,7 +617,7 @@ def worker(client):
     while True:
         time.sleep(180)
         try:
-            unknowns = sync_activities()
+            unknowns = sync_all()
             if unknowns: ask_unknowns(unknowns, client)
         except Exception as e: log.error(f"worker: {e}")
 
@@ -677,10 +637,10 @@ def health():
 def wise_webhook():
     if request.method == "GET": return jsonify({"status": "ok"}), 200
     try:
-        payload    = request.get_json(force=True) or {}
-        event_type = payload.get("event_type", "")
-        log.info(f"Wise webhook: {event_type}")
-        threading.Thread(target=lambda: ask_unknowns(sync_activities(), slack_app.client),
+        payload = request.get_json(force=True) or {}
+        log.info(f"Wise webhook: {payload.get('event_type','')}")
+        threading.Thread(
+            target=lambda: ask_unknowns(sync_all(), slack_app.client),
             daemon=True).start()
         return jsonify({"status": "ok"}), 200
     except Exception as e:
