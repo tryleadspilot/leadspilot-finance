@@ -320,8 +320,30 @@ def resolve_name(account_id):
         if r.status_code == 200:
             d = r.json()
             name = (d.get("accountHolderName") or d.get("name") or
-                    (d.get("details") or {}).get("accountHolderName"))
+                    (d.get("details") or {}).get("accountHolderName") or
+                    (d.get("details") or {}).get("email") or
+                    (d.get("details") or {}).get("bankName"))
             if name: _name_cache[key] = name; return name
+    except: pass
+    return None
+
+def resolve_transfer_name(transfer_id):
+    """Get recipient name directly from transfer details."""
+    if not transfer_id: return None
+    try:
+        r = requests.get(f"{WISE_BASE}/v1/transfers/{transfer_id}",
+            headers=wise_h(), timeout=6)
+        if r.status_code == 200:
+            d = r.json()
+            det = d.get("details") or {}
+            # Try recipient from transfer
+            acct_id = d.get("targetAccount")
+            if acct_id:
+                name = resolve_name(acct_id)
+                if name: return name
+            # Try reference/description
+            ref = det.get("reference") or det.get("transferPurpose") or ""
+            if ref and len(ref) > 2: return ref
     except: pass
     return None
 
@@ -350,9 +372,15 @@ def sync_transfers():
                 acct_id  = tx.get("targetAccount")
                 raw_name = resolve_name(acct_id) if acct_id else None
                 if not raw_name:
+                    # Try getting name from transfer details directly
+                    tid = str(tx.get("id",""))
+                    raw_name = resolve_transfer_name(tid) if tid else None
+                if not raw_name:
                     det = tx.get("details") or {}
-                    raw_name = safe_name(det.get("recipient")) or safe_name(det.get("reference")) or f"transfer-{tx.get('id','')}"
-                raw_name = safe_name(raw_name) or str(raw_name)
+                    raw_name = safe_name(det.get("recipient")) or safe_name(det.get("reference")) or ""
+                if not raw_name:
+                    raw_name = f"transfer-{tx.get('id','')}"
+                raw_name = safe_name(raw_name) if not raw_name.startswith("transfer-") else raw_name
                 date_s = tx.get("created", "")
                 try: d = datetime.fromisoformat(date_s.replace("Z", "+00:00")).date()
                 except: d = datetime.now().date()
