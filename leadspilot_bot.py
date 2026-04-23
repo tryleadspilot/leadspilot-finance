@@ -336,11 +336,13 @@ def load_all_history():
                             "type":"COMPACT"}, timeout=25)
                 if r.status_code != 200: break
                 for tx in r.json().get("transactions",[]):
-                    # ONLY card transactions — bank transfers handled by /v1/transfers
                     ref = str(tx.get("referenceNumber") or "")
-                    if not ref.startswith("CARD_TRANSACTION"): continue
                     val = float(tx.get("amount",{}).get("value",0))
-                    if val >= 0: continue  # only debits
+                    if val >= 0: continue  # only debits (money going out)
+                    # Skip bank transfers — already loaded via /v1/transfers to avoid double counting
+                    if ref.startswith("TRANSFER"): continue
+                    # Skip currency conversions — money stays in your account
+                    if ref.startswith("BALANCE_TRANSACTION"): continue
                     amount = abs(val)
                     det = tx.get("details",{}) or {}
                     name = ""
@@ -349,13 +351,14 @@ def load_all_history():
                         if v and isinstance(v, str) and v.strip():
                             name = v.strip(); break
                     if not name: continue
-                    if any(s in name.lower() for s in ("divisible","leads pilot")): continue
+                    if any(s in name.lower() for s in ("divisible","leads pilot","leadspilot")): continue
                     aud = to_aud(amount, currency)
                     date_s = tx.get("date") or tx.get("createdAt","")
                     try: d = datetime.fromisoformat(date_s.replace("Z","+00:00"))
                     except: d = datetime.now(timezone.utc)
+                    tx_id = ref if ref else f"stmt_{bal_id}_{date_s}_{amount}"
                     clean, cat = quick_categorize(name)
-                    save_tx(ref, d, amount, currency, aud, None, name, clean, cat, "CARD", False)
+                    save_tx(tx_id, d, amount, currency, aud, None, name, clean, cat, "CARD", False)
                     total += 1
             except Exception as e: log.error(f"stmt chunk: {e}")
             chunk_end = chunk_start
