@@ -68,6 +68,7 @@ def init_db():
             note         TEXT,
             tx_type      TEXT,
             status       TEXT DEFAULT 'completed',
+            is_expense   BOOLEAN DEFAULT TRUE,
             is_new       BOOLEAN DEFAULT FALSE
         );
 
@@ -140,6 +141,61 @@ def save_tx(tx_id, created_at, amount, currency, amount_aud, recipient_id, name,
              str(recipient_id) if recipient_id else None,
              name, clean_name, category, tx_type, status, is_new))
     except Exception as e: log.error(f"save_tx: {e}")
+
+
+# Fast category lookup — no API calls needed for known names
+_KNOWN_CATS = {
+    "signal house": ("Signal House SMS", "SMS Cost"),
+    "sendivo": ("Sendivo", "SMS Cost"),
+    "fanbasis": ("Fanbasis (Jacob)", "Data Provider"),
+    "zeeshan": ("Zeeshan Shabbir", "Data Provider"),
+    "ghulam shabir": ("Zeeshan Shabbir", "Data Provider"),
+    "muhammad hisham": ("Muhammad Hisham", "Personal"),
+    "abdul rehman tahir": ("Abdul Rehman Tahir", "Hardware"),
+    "abdul rehman": ("Abdul Rehman", "Personal"),
+    "starla": ("Starla", "Salary"),
+    "nina selvendy": ("Nina", "Salary"),
+    "john isaac": ("John", "Salary"),
+    "queenzen": ("Queenzen", "Salary"),
+    "annalyn": ("Annalyn", "Salary"),
+    "interactive brokers": ("Interactive Brokers", "Investment"),
+    "usman ahmed": ("Usman Ahmed", "Rent"),
+    "wahaj": ("Wahaj Khan", "Loan/Personal"),
+    "shayan amir": ("Wahaj Khan", "Loan/Personal"),
+    "moeez": ("Moeez Mazhar", "Hardware"),
+    "pak mac": ("Pak Mac AC", "Hardware"),
+    "anthropic": ("Anthropic", "Software"),
+    "claude": ("Claude", "Software"),
+    "highlevel": ("HighLevel", "Software"),
+    "high level": ("HighLevel", "Software"),
+    "calendly": ("Calendly", "Software"),
+    "opus virtual": ("Opus Virtual Offices", "Software"),
+    "zoom": ("Zoom", "Software"),
+    "n8n": ("N8n Cloud", "Software"),
+    "slack": ("Slack", "Software"),
+    "framer": ("Framer", "Software"),
+    "google": ("Google Workspace", "Software"),
+    "retell": ("Retell AI", "Software"),
+    "instantly": ("Instantly", "Software"),
+    "whop": ("Whop", "Software"),
+    "grasshopper": ("Grasshopper", "Software"),
+    "bizee": ("Bizee", "Software"),
+    "onlinejobs": ("OnlineJobs.ph", "Software"),
+    "mulebuy": ("Mulebuy", "Personal"),
+    "rinip": ("Whop Rinip Ventures", "Business Other"),
+    "saurabh": ("Saurabh Kumar", "Business Other"),
+    "abdullah habib": ("Abdullah Habib", "Business Other"),
+    "inyxel": ("Inyxel Studios", "Business Other"),
+}
+
+def quick_categorize(name):
+    """Fast lookup for known recipients — no API call needed."""
+    if not name: return None, None
+    low = name.lower()
+    for key, (clean, cat) in _KNOWN_CATS.items():
+        if key in low:
+            return clean, cat
+    return None, None
 
 def get_pending_new():
     """Get new transactions that haven't been identified yet."""
@@ -296,15 +352,18 @@ def load_all_history():
                             name = recip.get("name","") or recip.get("accountHolderName","")
                     if not name: name = str(det.get("type","Unknown"))
                     if not name or name in ("Unknown","","None"): continue
-                    # Skip incoming
-                    if name in ("Divisible Inc","LEADS PILOT LLC","LeadsPilot"): continue
+                    # Skip ALL incoming transactions
+                    skip_names = ("Divisible Inc","LEADS PILOT LLC","LeadsPilot",
+                                  "LEADS PILOT","Wise","TransferWise Fee")
+                    if any(s.lower() in name.lower() for s in skip_names): continue
                     aud = to_aud(amount, currency)
                     date_s = tx.get("date") or tx.get("createdAt","")
                     try: d = datetime.fromisoformat(date_s.replace("Z","+00:00"))
                     except: d = datetime.now(timezone.utc)
                     ext_id = str(tx.get("referenceNumber") or f"stmt_{bal_id}_{date_s}_{amount}")
                     recip_data = None  # card transactions don't have recipient IDs
-                    save_tx(ext_id, d, amount, currency, aud, None, name, None, None, "CARD", False)
+                    clean, cat = quick_categorize(name)
+                    save_tx(ext_id, d, amount, currency, aud, None, name, clean, cat, "CARD", False)
                     total += 1
             except Exception as e: log.error(f"stmt chunk: {e}")
             chunk_end = chunk_start
@@ -468,7 +527,11 @@ def answer(q):
         cur = db.cursor()
         cur.execute("""
             SELECT COALESCE(category,'Unknown'), SUM(amount_aud), COUNT(*)
-            FROM transactions GROUP BY COALESCE(category,'Unknown')
+            FROM transactions
+            WHERE is_expense=TRUE
+            AND COALESCE(name,'') NOT ILIKE '%divisible%'
+            AND COALESCE(name,'') NOT ILIKE '%leads pilot%'
+            GROUP BY COALESCE(category,'Unknown')
             ORDER BY SUM(amount_aud) DESC
         """)
         cats = cur.fetchall()
@@ -476,7 +539,11 @@ def answer(q):
         # Recipient totals
         cur.execute("""
             SELECT COALESCE(clean_name,name), SUM(amount_aud), COUNT(*), COALESCE(category,'Unknown')
-            FROM transactions GROUP BY COALESCE(clean_name,name), COALESCE(category,'Unknown')
+            FROM transactions
+            WHERE is_expense=TRUE
+            AND COALESCE(name,'') NOT ILIKE '%divisible%'
+            AND COALESCE(name,'') NOT ILIKE '%leads pilot%'
+            GROUP BY COALESCE(clean_name,name), COALESCE(category,'Unknown')
             ORDER BY SUM(amount_aud) DESC LIMIT 30
         """)
         recips = cur.fetchall()
@@ -484,7 +551,11 @@ def answer(q):
         # This month
         cur.execute("""
             SELECT COALESCE(category,'Unknown'), SUM(amount_aud)
-            FROM transactions WHERE created_at >= %s
+            FROM transactions
+            WHERE created_at >= %s
+            AND is_expense=TRUE
+            AND COALESCE(name,'') NOT ILIKE '%divisible%'
+            AND COALESCE(name,'') NOT ILIKE '%leads pilot%'
             GROUP BY COALESCE(category,'Unknown') ORDER BY SUM(amount_aud) DESC
         """, (month_start,))
         month_cats = cur.fetchall()
@@ -493,7 +564,11 @@ def answer(q):
         cur.execute("""
             SELECT created_at, amount_aud, currency, amount, COALESCE(clean_name,name),
                    COALESCE(category,'Unknown'), COALESCE(status,'completed')
-            FROM transactions ORDER BY created_at DESC LIMIT 40
+            FROM transactions
+            WHERE is_expense=TRUE
+            AND COALESCE(name,'') NOT ILIKE '%divisible%'
+            AND COALESCE(name,'') NOT ILIKE '%leads pilot%'
+            ORDER BY created_at DESC LIMIT 40
         """)
         recent = cur.fetchall()
 
@@ -552,7 +627,11 @@ def startup(client):
             cur = db.cursor()
             cur.execute("""
                 SELECT COALESCE(category,'Unknown'), SUM(amount_aud), COUNT(*)
-                FROM transactions GROUP BY COALESCE(category,'Unknown')
+                FROM transactions
+                WHERE is_expense=TRUE
+                AND COALESCE(name,'') NOT ILIKE '%divisible%'
+                AND COALESCE(name,'') NOT ILIKE '%leads pilot%'
+                GROUP BY COALESCE(category,'Unknown')
                 ORDER BY SUM(amount_aud) DESC
             """)
             cats = cur.fetchall()
