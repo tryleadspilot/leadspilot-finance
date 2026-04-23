@@ -336,39 +336,26 @@ def load_all_history():
                             "type":"COMPACT"}, timeout=25)
                 if r.status_code != 200: break
                 for tx in r.json().get("transactions",[]):
+                    # ONLY card transactions — bank transfers handled by /v1/transfers
+                    ref = str(tx.get("referenceNumber") or "")
+                    if not ref.startswith("CARD_TRANSACTION"): continue
                     val = float(tx.get("amount",{}).get("value",0))
                     if val >= 0: continue  # only debits
                     amount = abs(val)
                     det = tx.get("details",{}) or {}
-                    # Extract name safely
                     name = ""
                     for key in ["merchant","senderName","description"]:
                         v = det.get(key)
                         if v and isinstance(v, str) and v.strip():
                             name = v.strip(); break
-                    if not name:
-                        recip = det.get("recipient")
-                        if isinstance(recip, dict):
-                            name = recip.get("name","") or recip.get("accountHolderName","")
-                    if not name: name = str(det.get("type","Unknown"))
-                    if not name or name in ("Unknown","","None"): continue
-                    # Skip incoming and internal transactions
-                    skip_names = ("divisible inc","leads pilot","leadspilot",
-                                  "wise","transferwise fee","conversion","balance conversion")
-                    if any(s in name.lower() for s in skip_names): continue
-                    # Skip conversion transaction types
-                    tx_type_detail = str(det.get("type","")).upper()
-                    if tx_type_detail in ("CONVERSION","BALANCE_CASHBACK","INTEREST","FEE"): continue
-                    # Skip if it's the same account (internal transfer)
-                    if "LEADS PILOT" in name.upper(): continue
+                    if not name: continue
+                    if any(s in name.lower() for s in ("divisible","leads pilot")): continue
                     aud = to_aud(amount, currency)
                     date_s = tx.get("date") or tx.get("createdAt","")
                     try: d = datetime.fromisoformat(date_s.replace("Z","+00:00"))
                     except: d = datetime.now(timezone.utc)
-                    ext_id = str(tx.get("referenceNumber") or f"stmt_{bal_id}_{date_s}_{amount}")
-                    recip_data = None  # card transactions don't have recipient IDs
                     clean, cat = quick_categorize(name)
-                    save_tx(ext_id, d, amount, currency, aud, None, name, clean, cat, "CARD", False)
+                    save_tx(ref, d, amount, currency, aud, None, name, clean, cat, "CARD", False)
                     total += 1
             except Exception as e: log.error(f"stmt chunk: {e}")
             chunk_end = chunk_start
