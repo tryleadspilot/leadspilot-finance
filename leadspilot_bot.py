@@ -67,6 +67,7 @@ def init_db():
             category     TEXT,
             note         TEXT,
             tx_type      TEXT,
+            status       TEXT DEFAULT 'completed',
             is_new       BOOLEAN DEFAULT FALSE
         );
 
@@ -127,17 +128,17 @@ def tx_exists(tx_id):
         return cur.fetchone() is not None
     except: return False
 
-def save_tx(tx_id, created_at, amount, currency, amount_aud, recipient_id, name, clean_name, category, tx_type, is_new=False):
+def save_tx(tx_id, created_at, amount, currency, amount_aud, recipient_id, name, clean_name, category, tx_type, is_new=False, status="completed"):
     db = get_db()
     if not db: return
     try:
         db.cursor().execute(
-            "INSERT INTO transactions(id,created_at,amount,currency,amount_aud,recipient_id,name,clean_name,category,tx_type,is_new) "
-            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT(id) DO UPDATE SET clean_name=EXCLUDED.clean_name, category=EXCLUDED.category",
+            "INSERT INTO transactions(id,created_at,amount,currency,amount_aud,recipient_id,name,clean_name,category,tx_type,status,is_new) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT(id) DO UPDATE SET clean_name=EXCLUDED.clean_name, category=EXCLUDED.category, status=EXCLUDED.status",
             (str(tx_id), created_at, float(amount), currency, float(amount_aud),
              str(recipient_id) if recipient_id else None,
-             name, clean_name, category, tx_type, is_new))
+             name, clean_name, category, tx_type, status, is_new))
     except Exception as e: log.error(f"save_tx: {e}")
 
 def get_pending_new():
@@ -228,7 +229,8 @@ def load_all_history():
             batch = r.json() if isinstance(r.json(), list) else r.json().get("content",[])
             if not batch: break
             for tx in batch:
-                if tx.get("status") != "outgoing_payment_sent": continue
+                status = tx.get("status","")
+                if status not in ("outgoing_payment_sent","processing","incoming_payment_waiting","funds_converted"): continue
                 tx_id  = str(tx.get("id",""))
                 amount = float(tx.get("sourceValue") or 0)
                 cur    = tx.get("sourceCurrency","AUD")
@@ -246,7 +248,8 @@ def load_all_history():
                 recip_data = get_recipient(str(acct_id)) if acct_id else None
                 clean = recip_data[1] if recip_data else None
                 cat   = recip_data[2] if recip_data else None
-                save_tx(tx_id, d, amount, cur, aud, acct_id, name, clean, cat, "TRANSFER", False)
+                tx_status = "pending" if tx.get("status") in ("processing","incoming_payment_waiting") else "completed"
+                save_tx(tx_id, d, amount, cur, aud, acct_id, name, clean, cat, "TRANSFER", False, tx_status)
                 total += 1
             if len(batch) < 100: break
             offset += 100
@@ -322,7 +325,8 @@ def get_new_transfers():
         r.raise_for_status()
         batch = r.json() if isinstance(r.json(), list) else r.json().get("content",[])
         for tx in batch:
-            if tx.get("status") != "outgoing_payment_sent": continue
+            status = tx.get("status","")
+            if status not in ("outgoing_payment_sent","processing","incoming_payment_waiting","funds_converted"): continue
             tx_id = str(tx.get("id",""))
             if not tx_id or tx_exists(tx_id): continue
             amount = float(tx.get("sourceValue") or 0)
@@ -340,8 +344,9 @@ def get_new_transfers():
             recip_data = get_recipient(str(acct_id)) if acct_id else None
             clean = recip_data[1] if recip_data else None
             cat   = recip_data[2] if recip_data else None
-            save_tx(tx_id, d, amount, cur, aud, acct_id, name, clean, cat, "TRANSFER", True)
-            new_txs.append((tx_id, name, aud, cur, amount, acct_id, d))
+            tx_status = "pending" if tx.get("status") in ("processing","incoming_payment_waiting") else "completed"
+            save_tx(tx_id, d, amount, cur, aud, acct_id, name, clean, cat, "TRANSFER", True, tx_status)
+            new_txs.append((tx_id, name, aud, cur, amount, acct_id, d, tx_status))
     except Exception as e: log.error(f"get_new_transfers: {e}")
     return new_txs
 
@@ -387,7 +392,7 @@ Return JSON only."""
 # ── NOTIFY NEW TRANSACTION ────────────────────────────────────────────────────
 _pending_context = {}  # tx_id -> tx info, for when user replies
 
-def notify_new_tx(tx_id, name, amount_aud, currency, amount_orig, acct_id, created_at, client):
+def notify_new_tx(tx_id, name, amount_aud, currency, amount_orig, acct_id, created_at, client, tx_status="completed"):
     """Post to Slack asking about a new transaction."""
     # Try Claude auto-categorize first
     auto = claude_categorize(name, "", f"amount: {amount_aud:.2f} AUD")
@@ -401,7 +406,9 @@ def notify_new_tx(tx_id, name, amount_aud, currency, amount_orig, acct_id, creat
                 acct_id, name, clean, cat, "TRANSFER", False)
         if acct_id: save_recipient(str(acct_id), name, clean, cat, note)
         est_time = created_at.astimezone(EST).strftime("%b %d %I:%M %p EST")
-        msg = (f":white_check_mark: *New transaction logged:*\n"
+        status_icon = ":hourglass_flowing_sand:" if tx_status == "pending" else ":white_check_mark:"
+        status_label = " *(PENDING — not sent yet)*" if tx_status == "pending" else ""
+        msg = (f"{status_icon} *New transaction logged{status_label}:*\n"
                f"*{est_time}* — {amount_aud:,.2f} AUD")
         if currency != "AUD":
             msg += f" ({amount_orig:,.2f} {currency})"
@@ -410,8 +417,9 @@ def notify_new_tx(tx_id, name, amount_aud, currency, amount_orig, acct_id, creat
     else:
         # Ask Suleman
         est_time = created_at.astimezone(EST).strftime("%b %d %I:%M %p EST")
-        msg = (f":question: *New transaction — {est_time}*\n"
-               f"You sent *{amount_aud:,.2f} AUD*")
+        status_label = " *(PENDING — not sent yet)*" if tx_status == "pending" else ""
+        msg = (f":question: *New transaction{status_label} — {est_time}*\n"
+               f"You {'are sending' if tx_status == 'pending' else 'sent'} *{amount_aud:,.2f} AUD*")
         if currency != "AUD":
             msg += f" ({amount_orig:,.2f} {currency})"
         msg += f" to *`{name}`*\n\n"
@@ -483,7 +491,8 @@ def answer(q):
 
         # Recent 40
         cur.execute("""
-            SELECT created_at, amount_aud, currency, amount, COALESCE(clean_name,name), COALESCE(category,'Unknown')
+            SELECT created_at, amount_aud, currency, amount, COALESCE(clean_name,name),
+                   COALESCE(category,'Unknown'), COALESCE(status,'completed')
             FROM transactions ORDER BY created_at DESC LIMIT 40
         """)
         recent = cur.fetchall()
@@ -491,12 +500,13 @@ def answer(q):
         cat_text    = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]})" for r in cats)
         recip_text  = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips)
         month_text  = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD" for r in month_cats)
-        recent_text = "\n".join(
-            f"  {r[0].astimezone(EST).strftime('%b %d %I:%M %p EST')}: "
-            f"{float(r[1]):,.2f} AUD" +
-            (f" ({float(r[3]):,.2f} {r[2]})" if r[2]!="AUD" else "") +
-            f" -> {r[4]} [{r[5]}]"
-            for r in recent)
+        def fmt_recent(r):
+            time_str = r[0].astimezone(EST).strftime("%b %d %I:%M %p EST") if r[0] else "?"
+            status_tag = " [PENDING]" if len(r) > 6 and r[6] == "pending" else ""
+            amt = f"{float(r[1]):,.2f} AUD"
+            if r[2] != "AUD": amt += f" ({float(r[3]):,.2f} {r[2]})"
+            return f"  {time_str}: {amt} -> {r[4]} [{r[5]}]{status_tag}"
+        recent_text = "\n".join(fmt_recent(r) for r in recent)
 
         system = f"""You are the accountant for LeadsPilot — Suleman's SMS lead gen business (AUD account).
 Answer directly. All times in EST. All amounts in AUD (show original currency in brackets if different).
@@ -571,8 +581,10 @@ def worker(client):
         time.sleep(180)
         try:
             new_txs = get_new_transfers()
-            for tx_id, name, aud, cur, orig, acct_id, d in new_txs:
-                notify_new_tx(tx_id, name, aud, cur, orig, acct_id, d, client)
+            for tx in new_txs:
+                tx_id, name, aud, cur, orig, acct_id, d = tx[0], tx[1], tx[2], tx[3], tx[4], tx[5], tx[6]
+                tx_status = tx[7] if len(tx) > 7 else "completed"
+                notify_new_tx(tx_id, name, aud, cur, orig, acct_id, d, client, tx_status)
         except Exception as e: log.error(f"worker: {e}")
 
 # ── FLASK ─────────────────────────────────────────────────────────────────────
@@ -603,8 +615,10 @@ def wise_webhook():
         if "transfer" in event_type.lower():
             def handle():
                 new_txs = get_new_transfers()
-                for tx_id, name, aud, cur, orig, acct_id, d in new_txs:
-                    notify_new_tx(tx_id, name, aud, cur, orig, acct_id, d, slack_app.client)
+                for tx in new_txs:
+                    tx_id, name, aud, cur, orig, acct_id, d = tx[0],tx[1],tx[2],tx[3],tx[4],tx[5],tx[6]
+                    tx_status = tx[7] if len(tx) > 7 else "completed"
+                    notify_new_tx(tx_id, name, aud, cur, orig, acct_id, d, slack_app.client, tx_status)
             threading.Thread(target=handle, daemon=True).start()
         return jsonify({"status":"ok"}), 200
     except Exception as e:
