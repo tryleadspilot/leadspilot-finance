@@ -352,10 +352,15 @@ def load_all_history():
                             name = recip.get("name","") or recip.get("accountHolderName","")
                     if not name: name = str(det.get("type","Unknown"))
                     if not name or name in ("Unknown","","None"): continue
-                    # Skip ALL incoming transactions
-                    skip_names = ("Divisible Inc","LEADS PILOT LLC","LeadsPilot",
-                                  "LEADS PILOT","Wise","TransferWise Fee")
-                    if any(s.lower() in name.lower() for s in skip_names): continue
+                    # Skip incoming and internal transactions
+                    skip_names = ("divisible inc","leads pilot","leadspilot",
+                                  "wise","transferwise fee","conversion","balance conversion")
+                    if any(s in name.lower() for s in skip_names): continue
+                    # Skip conversion transaction types
+                    tx_type_detail = str(det.get("type","")).upper()
+                    if tx_type_detail in ("CONVERSION","BALANCE_CASHBACK","INTEREST","FEE"): continue
+                    # Skip if it's the same account (internal transfer)
+                    if "LEADS PILOT" in name.upper(): continue
                     aud = to_aud(amount, currency)
                     date_s = tx.get("date") or tx.get("createdAt","")
                     try: d = datetime.fromisoformat(date_s.replace("Z","+00:00"))
