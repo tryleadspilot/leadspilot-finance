@@ -265,6 +265,35 @@ def get_account_name(account_id):
     except: pass
     return None
 
+
+def import_wise_csv(csv_text):
+    """Import Wise CSV export — gets exact merchant names for all transactions."""
+    import csv, io
+    reader = csv.DictReader(io.StringIO(csv_text))
+    count = 0
+    for row in reader:
+        if row.get("Status","").strip() not in ("COMPLETED","REFUNDED"): continue
+        if row.get("Direction","").strip() != "OUT": continue
+        tx_id    = row.get("ID","").strip()
+        raw_name = row.get("Target name","").strip()
+        amount   = float(row.get("Source amount (after fees)","0") or 0)
+        currency = row.get("Source currency","AUD").strip()
+        date_s   = row.get("Created on","").strip()[:10]
+        if not tx_id or not raw_name or amount == 0: continue
+        try: d = datetime.strptime(date_s, "%Y-%m-%d")
+        except: continue
+        # Convert to UTC
+        d = d.replace(tzinfo=timezone.utc)
+        aud = to_aud(amount, currency) if currency != "AUD" else amount
+        clean, cat = quick_categorize(raw_name)
+        # Skip incoming
+        if raw_name in ("Divisible Inc","LEADS PILOT LLC"): continue
+        save_tx(tx_id, d, amount, currency, aud, None, raw_name, clean, cat, 
+                "CARD" if "CARD_TRANSACTION" in tx_id else "TRANSFER", False)
+        count += 1
+    log.info(f"CSV imported: {count} transactions")
+    return count
+
 def load_all_history():
     """
     Silently load ALL Wise transaction history into DB.
@@ -362,6 +391,14 @@ def load_all_history():
                     total += 1
             except Exception as e: log.error(f"stmt chunk: {e}")
             chunk_end = chunk_start
+
+    # Also try to load from CSV if available (gets exact merchant names)
+    for path in ["transaction-history.csv", "/app/transaction-history.csv"]:
+        if os.path.exists(path):
+            log.info(f"Also loading CSV from {path}")
+            with open(path, "r") as f:
+                import_wise_csv(f.read())
+            break
 
     log.info(f"History loaded: {total} transactions")
     return total
