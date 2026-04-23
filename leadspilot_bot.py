@@ -444,7 +444,8 @@ ALL TIME BY RECIPIENT:
 {rec_all}
 
 RECENT TRANSACTIONS:
-{recent_text}"""
+{recent_text}
+{pending_text}"""
 
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
