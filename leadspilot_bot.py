@@ -78,9 +78,9 @@ def init_db():
             note       TEXT
         );
 
-        CREATE INDEX idx_tx_date ON transactions(created_at);
-        CREATE INDEX idx_tx_cat  ON transactions(category);
-        CREATE INDEX idx_tx_new  ON transactions(is_new);
+        CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(created_at);
+        CREATE INDEX IF NOT EXISTS idx_tx_cat  ON transactions(category);
+        CREATE INDEX IF NOT EXISTS idx_tx_new  ON transactions(is_new);
     """)
     log.info("DB initialized fresh")
 
