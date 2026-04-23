@@ -248,9 +248,7 @@ def sync_transfers(is_new_run=False):
                 if rec and rec[2]:
                     clean, cat = rec[1], rec[2]
                 else:
-                    result = claude_categorize(name, aud, cur)
-                    clean = result.get("clean_name", name)
-                    cat   = result.get("category", "Unknown")
+                    clean, cat = fast_categorize(name)
                     if acct_id and cat != "Unknown":
                         save_recipient(str(acct_id), name, clean, cat)
                 tx_status = "pending" if status in ("processing","incoming_payment_waiting") else "completed"
@@ -313,11 +311,9 @@ def sync_card_transactions():
                     date_s = tx.get("date") or tx.get("createdAt","")
                     try: d = datetime.fromisoformat(date_s.replace("Z","+00:00"))
                     except: d = datetime.now(timezone.utc)
-                    # Categorize with Claude
-                    result = claude_categorize(name, aud, currency)
-                    clean = result.get("clean_name", name)
-                    cat   = result.get("category", "Unknown")
-                    save_tx(ref, d, amount, currency, aud, name, clean, cat, "CARD")
+                    # Fast keyword categorization (no API call for history)
+                    clean, cat = fast_categorize(name)
+                    save_tx(ref, d, amount, currency, aud, name, clean, cat, "CARD", "completed", False)
                     total += 1
             except Exception as e: log.error(f"card chunk: {e}")
             chunk_end = chunk_start
