@@ -1,8 +1,10 @@
 """
-Wise Accountant Bot - Simple & Working
-1. Load CSV on startup silently -> post one summary
-2. New transactions -> notify Suleman -> he tells bot who it is
-3. Webhook for live notifications
+Wise Accountant Bot — Final Clean Version
+- Load CSV silently on startup, post ONE summary
+- Never ask about past transactions
+- Ask about NEW transactions only (going forward)
+- Resolve real names from CSV (not IDs)
+- Webhook for instant notifications
 """
 import os, re, csv, io, json, logging, requests, threading, time, ssl, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -53,17 +55,17 @@ def init_db():
         DROP TABLE IF EXISTS wise_tx;
         DROP TABLE IF EXISTS recipients;
         CREATE TABLE wise_tx (
-            id         TEXT PRIMARY KEY,
-            date       DATE NOT NULL,
-            amount_aud NUMERIC(14,4),
-            currency   TEXT,
+            id          TEXT PRIMARY KEY,
+            date        DATE NOT NULL,
+            amount_aud  NUMERIC(14,4),
+            currency    TEXT,
             amount_orig NUMERIC(14,4),
-            name       TEXT,
-            clean_name TEXT,
-            category   TEXT,
-            note       TEXT,
-            tx_type    TEXT,
-            is_new     BOOLEAN DEFAULT FALSE
+            name        TEXT,
+            clean_name  TEXT,
+            category    TEXT,
+            note        TEXT,
+            tx_type     TEXT,
+            is_new      BOOLEAN DEFAULT FALSE
         );
         CREATE TABLE recipients (
             name       TEXT PRIMARY KEY,
@@ -73,23 +75,26 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_date ON wise_tx(date);
         CREATE INDEX IF NOT EXISTS idx_new  ON wise_tx(is_new);
+        CREATE INDEX IF NOT EXISTS idx_cat  ON wise_tx(category);
     """)
     log.info("DB ready")
 
-def upsert(tx_id, date, amount_aud, currency, amount_orig, name, clean_name=None, category=None, note=None, tx_type="CARD", is_new=False):
+def upsert_tx(tx_id, date, amount_aud, currency, amount_orig, name, clean_name=None, category=None, note=None, tx_type="CARD", is_new=False):
     db = get_db()
     if not db: return
     try:
         db.cursor().execute(
             "INSERT INTO wise_tx(id,date,amount_aud,currency,amount_orig,name,clean_name,category,note,tx_type,is_new) "
             "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-            "ON CONFLICT(id) DO UPDATE SET clean_name=COALESCE(EXCLUDED.clean_name,wise_tx.clean_name),"
-            "category=COALESCE(EXCLUDED.category,wise_tx.category)",
+            "ON CONFLICT(id) DO UPDATE SET "
+            "clean_name=COALESCE(EXCLUDED.clean_name,wise_tx.clean_name),"
+            "category=COALESCE(EXCLUDED.category,wise_tx.category),"
+            "is_new=CASE WHEN wise_tx.is_new=FALSE THEN FALSE ELSE EXCLUDED.is_new END",
             (tx_id, date, float(amount_aud), currency, float(amount_orig),
              name, clean_name, category, note, tx_type, is_new))
-    except Exception as e: log.error(f"upsert: {e}")
+    except Exception as e: log.error(f"upsert_tx: {e}")
 
-def exists(tx_id):
+def tx_exists(tx_id):
     db = get_db()
     if not db: return False
     try:
@@ -98,7 +103,7 @@ def exists(tx_id):
         return cur.fetchone() is not None
     except: return False
 
-def get_recipient(name):
+def get_known(name):
     db = get_db()
     if not db: return None
     try:
@@ -107,7 +112,7 @@ def get_recipient(name):
         return cur.fetchone()
     except: return None
 
-def save_recipient(name, clean_name, category, note=""):
+def save_known(name, clean_name, category, note=""):
     db = get_db()
     if not db: return
     try:
@@ -119,7 +124,7 @@ def save_recipient(name, clean_name, category, note=""):
         db.cursor().execute(
             "UPDATE wise_tx SET clean_name=%s,category=%s,note=%s,is_new=FALSE WHERE name=%s",
             (clean_name, category, note, name))
-    except Exception as e: log.error(f"save_recipient: {e}")
+    except Exception as e: log.error(f"save_known: {e}")
 
 def to_aud(amount, currency):
     if currency == "AUD": return float(amount)
@@ -127,46 +132,101 @@ def to_aud(amount, currency):
         r = requests.get(f"https://api.exchangerate-api.com/v4/latest/{currency}", timeout=5)
         return round(float(amount) * r.json()["rates"]["AUD"], 4)
     except:
-        return round(float(amount) * {"USD":1.56,"GBP":1.97,"EUR":1.72,"PKR":0.0056,"PHP":0.027}.get(currency,1.0), 4)
+        return round(float(amount) * {
+            "USD":1.56,"GBP":1.97,"EUR":1.72,"PKR":0.0056,"PHP":0.027
+        }.get(currency, 1.0), 4)
 
-# ── CSV IMPORT ────────────────────────────────────────────────────────────────
-def import_csv(text):
-    """Import Wise CSV export. Only COMPLETED OUT transactions."""
+# ── CLAUDE SMART CATEGORIZE ───────────────────────────────────────────────────
+def smart_categorize(name):
+    """Auto-categorize using Claude intelligence. Used for history load only."""
+    n = name.lower()
+    # Software (all business cost as Suleman said)
+    if any(x in n for x in ["signal house","sendivo"]): return "Signal House SMS" if "signal" in n else "Sendivo", "SMS Cost"
+    if any(x in n for x in ["fanbasis"]): return "Fanbasis (Jacob)", "Data Provider"
+    if any(x in n for x in ["zeeshan","ghulam shabir"]): return "Zeeshan Shabbir", "Data Provider"
+    if any(x in n for x in ["anthropic","claude"]): return name, "Software"
+    if any(x in n for x in ["highlevel","high level"]): return "HighLevel", "Software"
+    if any(x in n for x in ["calendly"]): return "Calendly", "Software"
+    if any(x in n for x in ["zoom"]): return "Zoom", "Software"
+    if any(x in n for x in ["slack"]): return "Slack", "Software"
+    if any(x in n for x in ["n8n","n8n cloud"]): return "N8n Cloud", "Software"
+    if any(x in n for x in ["retell"]): return "Retell AI", "Software"
+    if any(x in n for x in ["instantly"]): return "Instantly", "Software"
+    if any(x in n for x in ["framer"]): return "Framer", "Software"
+    if any(x in n for x in ["google"]): return "Google Workspace", "Software"
+    if any(x in n for x in ["opus virtual"]): return "Opus Virtual Offices", "Software"
+    if any(x in n for x in ["grasshopper"]): return "Grasshopper", "Software"
+    if any(x in n for x in ["onlinejobs","onlinejobsph"]): return "OnlineJobs.ph", "Software"
+    if any(x in n for x in ["bizee"]): return "Bizee", "Software"
+    if any(x in n for x in ["whop"]): return "Whop", "Software"
+    if any(x in n for x in ["airbnb"]): return "Airbnb", "Personal"
+    if any(x in n for x in ["mulebuy"]): return "Mulebuy", "Personal"
+    if any(x in n for x in ["interactive brokers"]): return "Interactive Brokers", "Investment"
+    if any(x in n for x in ["usman ahmed"]): return "Usman Ahmed", "Rent"
+    if any(x in n for x in ["wahaj","shayan amir"]): return "Wahaj Khan", "Loan/Personal"
+    if any(x in n for x in ["muhammad hisham","abdul rehman"]): return name.strip(), "Personal"
+    if any(x in n for x in ["starla","nina","queenzen","john isaac","annalyn","budejas"]): return name, "Salary"
+    if any(x in n for x in ["moeez mazhar","pak mac","abdul rehman tahir"]): return name, "Hardware"
+    if any(x in n for x in ["rinip","saurabh","abdullah habib","inyxel"]): return name, "Business Other"
+    return name, "Unknown"
+
+# ── CSV IMPORT (SILENT) ───────────────────────────────────────────────────────
+def import_csv_silent(text):
+    """
+    Import Wise CSV silently — no questions about past transactions.
+    Uses Target name from CSV (real names, not IDs).
+    Auto-categorizes using smart_categorize.
+    """
     reader = csv.DictReader(io.StringIO(text))
     count = 0
     for row in reader:
         if row.get("Status","").strip() != "COMPLETED": continue
         if row.get("Direction","").strip() != "OUT": continue
         tx_id    = row.get("ID","").strip()
-        raw_name = row.get("Target name","").strip()
-        src_amt  = row.get("Source amount (after fees)","0").strip() or "0"
+        name     = row.get("Target name","").strip()
+        src_amt  = float(row.get("Source amount (after fees)","0") or 0)
         src_cur  = row.get("Source currency","AUD").strip()
-        tgt_amt  = row.get("Target amount (after fees)","0").strip() or "0"
+        tgt_amt  = float(row.get("Target amount (after fees)","0") or 0)
         tgt_cur  = row.get("Target currency","AUD").strip()
         date_s   = row.get("Created on","").strip()[:10]
-        if not tx_id or not raw_name: continue
-        # Use target amount if USD (more accurate), else source
-        if tgt_cur == "USD":
-            amount_orig = float(tgt_amt or 0)
+        if not tx_id or not name or not date_s: continue
+        # Skip self-transfers
+        if name in ("Divisible Inc","LEADS PILOT LLC","LEADS PILOT LLC"): continue
+        # Use target USD amount if available, else source AUD
+        if tgt_cur == "USD" and tgt_amt > 0:
             currency = "USD"
-            amount_aud = to_aud(amount_orig, "USD")
+            amount_orig = tgt_amt
+            amount_aud = to_aud(tgt_amt, "USD")
+        elif tgt_cur == "PKR" and tgt_amt > 0:
+            currency = "PKR"
+            amount_orig = tgt_amt
+            amount_aud = to_aud(tgt_amt, "PKR")
+        elif tgt_cur == "PHP" and tgt_amt > 0:
+            currency = "PHP"
+            amount_orig = tgt_amt
+            amount_aud = to_aud(tgt_amt, "PHP")
         else:
-            amount_orig = float(src_amt or 0)
             currency = src_cur
-            amount_aud = to_aud(amount_orig, currency)
+            amount_orig = src_amt
+            amount_aud = to_aud(src_amt, src_cur)
         if amount_aud == 0: continue
         try: date = datetime.strptime(date_s, "%Y-%m-%d").date()
         except: continue
-        # Skip incoming self-transfers
-        if raw_name in ("Divisible Inc", "LEADS PILOT LLC"): continue
-        known = get_recipient(raw_name)
-        upsert(tx_id, date, amount_aud, currency, amount_orig, raw_name,
-               known[0] if known else None,
-               known[1] if known else None,
-               known[2] if known else None,
-               "CARD" if "CARD_TRANSACTION" in tx_id else "TRANSFER")
+        tx_type = "CARD" if "CARD_TRANSACTION" in tx_id else "TRANSFER"
+        # Check if already known
+        known = get_known(name)
+        if known:
+            clean, cat, note = known
+        else:
+            clean, cat = smart_categorize(name)
+            note = ""
+            # Save to recipients table so we remember it
+            save_known(name, clean, cat, note)
+        # is_new = FALSE for all CSV imports (these are past transactions)
+        upsert_tx(tx_id, date, amount_aud, currency, amount_orig,
+                  name, clean, cat, note, tx_type, False)
         count += 1
-    log.info(f"CSV import: {count} transactions")
+    log.info(f"CSV imported: {count} transactions")
     return count
 
 # ── WISE API ──────────────────────────────────────────────────────────────────
@@ -195,7 +255,7 @@ def get_balances():
     return out
 
 _name_cache = {}
-def get_account_name(account_id):
+def resolve_name(account_id):
     if not account_id: return None
     key = str(account_id)
     if key in _name_cache: return _name_cache[key]
@@ -211,7 +271,7 @@ def get_account_name(account_id):
     return None
 
 def check_new_transfers():
-    """Check Wise API for new bank transfers not in DB."""
+    """Check for NEW bank transfers not in DB. Returns list of new ones."""
     pid = get_pid()
     new_txs = []
     try:
@@ -222,27 +282,32 @@ def check_new_transfers():
         for tx in batch:
             if tx.get("status") != "outgoing_payment_sent": continue
             tx_id = str(tx.get("id",""))
-            if not tx_id or exists(tx_id): continue
+            if not tx_id or tx_exists(tx_id): continue
             amount = float(tx.get("sourceValue") or 0)
             cur    = tx.get("sourceCurrency","AUD")
             aud    = to_aud(amount, cur)
+            # Get REAL name — resolve from account ID
             acct_id = tx.get("targetAccount")
-            name = get_account_name(acct_id) if acct_id else None
+            name = resolve_name(acct_id) if acct_id else None
             if not name:
                 det = tx.get("details") or {}
                 name = det.get("reference") or f"transfer-{tx_id}"
             date_s = tx.get("created","")
             try: d = datetime.fromisoformat(date_s.replace("Z","+00:00")).date()
             except: d = datetime.now().date()
-            known = get_recipient(name)
-            upsert(tx_id, d, aud, cur, amount, name,
-                   known[0] if known else None,
-                   known[1] if known else None,
-                   known[2] if known else None,
-                   "TRANSFER", not bool(known))
-            if not known:
-                new_txs.append({"id":tx_id,"name":name,"aud":aud,"cur":cur,"orig":amount,"date":d})
-    except Exception as e: log.error(f"check_transfers: {e}")
+            # Check if we already know this person
+            known = get_known(name)
+            if known:
+                clean, cat, note = known
+                upsert_tx(tx_id, d, aud, cur, amount, name, clean, cat, note, "TRANSFER", False)
+                # Just confirm silently
+                new_txs.append({"id":tx_id,"name":name,"clean":clean,"aud":aud,
+                                 "cur":cur,"orig":amount,"date":d,"known":True,"cat":cat})
+            else:
+                upsert_tx(tx_id, d, aud, cur, amount, name, None, None, None, "TRANSFER", True)
+                new_txs.append({"id":tx_id,"name":name,"clean":None,"aud":aud,
+                                 "cur":cur,"orig":amount,"date":d,"known":False,"cat":None})
+    except Exception as e: log.error(f"check_new: {e}")
     return new_txs
 
 def register_webhook():
@@ -257,7 +322,7 @@ def register_webhook():
                 headers=h, timeout=10,
                 json={"name":"LeadsPilot","trigger_on":"transfers#state-change",
                       "delivery":{"version":"2.0.0","url":url}})
-            log.info(f"Webhook: HTTP {r2.status_code}")
+            log.info(f"Webhook registered: HTTP {r2.status_code}")
         else:
             log.info("Webhook already registered")
     except Exception as e: log.error(f"webhook: {e}")
@@ -267,69 +332,77 @@ def get_summary():
     db = get_db()
     if not db: return {}
     try:
-        cur = db.cursor()
         now   = datetime.now(EST)
         month = now.date().replace(day=1)
-        # All time
+        cur   = db.cursor()
         cur.execute("SELECT COUNT(*), SUM(amount_aud), MIN(date), MAX(date) FROM wise_tx")
         count, total, oldest, newest = cur.fetchone()
-        # This month
         cur.execute("SELECT SUM(amount_aud) FROM wise_tx WHERE date>=%s", (month,))
-        month_total = cur.fetchone()[0] or 0
-        # By category all time
+        month_total = float((cur.fetchone() or [0])[0] or 0)
         cur.execute("""
             SELECT COALESCE(category,'Unknown'), SUM(amount_aud), COUNT(*)
             FROM wise_tx GROUP BY COALESCE(category,'Unknown')
             ORDER BY SUM(amount_aud) DESC
         """)
         cats = cur.fetchall()
-        return {
-            "count": count, "total": float(total or 0),
-            "oldest": oldest, "newest": newest,
-            "month_total": float(month_total),
-            "cats": cats, "month": month
-        }
-    except Exception as e:
-        log.error(f"summary: {e}"); return {}
+        return {"count":count,"total":float(total or 0),"oldest":oldest,
+                "newest":newest,"month_total":month_total,"cats":cats,"month":month}
+    except Exception as e: log.error(f"summary: {e}"); return {}
 
-# ── PENDING ───────────────────────────────────────────────────────────────────
+# ── PENDING (for new transactions) ────────────────────────────────────────────
 _pending = {}
 
 def notify_new(tx, client):
-    name = tx["name"]
-    aud  = tx["aud"]
-    cur  = tx["cur"]
-    orig = tx["orig"]
-    d    = tx["date"]
+    """Notify about a new transaction. Ask if unknown, confirm if known."""
     tx_id = tx["id"]
-    est_d = datetime.combine(d, datetime.min.time()).astimezone(EST).strftime("%b %d, %Y")
+    name  = tx["name"]
+    aud   = tx["aud"]
+    cur   = tx["cur"]
+    orig  = tx["orig"]
+    d     = tx["date"]
+    known = tx.get("known", False)
+    cat   = tx.get("cat","")
     amt   = f"{aud:,.2f} AUD" + (f" ({orig:,.2f} {cur})" if cur != "AUD" else "")
-    _pending[tx_id] = tx
-    try:
-        client.chat_postMessage(channel=CHANNEL_ID,
-            text=f":question: *New transaction — {est_d}*\n"
-                 f"You sent *{amt}* to *`{name}`*\n"
-                 f"Who is this and what's it for?")
-    except Exception as e: log.error(f"notify: {e}")
+
+    if known:
+        # Just confirm — no question
+        clean = tx.get("clean", name)
+        try:
+            client.chat_postMessage(channel=CHANNEL_ID,
+                text=f":white_check_mark: *New transaction — {d}*\n"
+                     f"{amt} to *{clean}* [{cat}]")
+        except: pass
+    else:
+        # Ask who it is
+        _pending[tx_id] = tx
+        try:
+            client.chat_postMessage(channel=CHANNEL_ID,
+                text=f":question: *New transaction — {d}*\n"
+                     f"You sent *{amt}* to *{name}*\n"
+                     f"Who is this?")
+        except Exception as e: log.error(f"notify: {e}")
 
 # ── CLAUDE ────────────────────────────────────────────────────────────────────
-def claude(prompt, system, max_tokens=400):
+def claude(prompt, system, max_tokens=500):
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":AI_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-haiku-4-5","max_tokens":max_tokens,"system":system,
-                  "messages":[{"role":"user","content":prompt}]},timeout=20)
+            headers={"x-api-key":AI_KEY,"anthropic-version":"2023-06-01",
+                     "content-type":"application/json"},
+            json={"model":"claude-haiku-4-5","max_tokens":max_tokens,
+                  "system":system,"messages":[{"role":"user","content":prompt}]},
+            timeout=20)
         if r.status_code == 200: return r.json()["content"][0]["text"].strip()
     except Exception as e: log.error(f"claude: {e}")
     return None
 
-def extract_recipient_info(text, tx_name, amount_aud):
+def extract_info(text, tx_name, aud):
+    """Extract clean name + category from user's reply."""
     result = claude(
-        f"Transaction to: {tx_name}\nAmount: {amount_aud:.2f} AUD\nUser says: {text}",
-        system="""Extract info from user's reply. Return JSON only:
+        f"Transaction to: {tx_name}\nAmount: {aud:.2f} AUD\nUser says: {text}",
+        """Extract info. Return JSON only (no markdown):
 {"clean_name":"readable name","category":"category","note":"what it is"}
 Categories: SMS Cost, Data Provider, Salary, Software, Personal, Rent, Investment, Hardware, Loan/Personal, Business Other
-Be smart — infer from context.""")
+Be smart — infer from context. e.g. "SMS provider" = SMS Cost, "data" = Data Provider""")
     if result:
         try: return json.loads(result)
         except: pass
@@ -340,72 +413,78 @@ def answer(q):
     try: bals = get_balances()
     except: bals = []
     db = get_db()
-    recents = []
-    by_recip = []
+    recips = []; recent = []
     if db:
         cur = db.cursor()
         cur.execute("""
-            SELECT date, amount_aud, currency, amount_orig, COALESCE(clean_name,name), COALESCE(category,'?')
-            FROM wise_tx ORDER BY date DESC LIMIT 30
-        """)
-        recents = cur.fetchall()
-        cur.execute("""
-            SELECT COALESCE(clean_name,name), SUM(amount_aud), COUNT(*), COALESCE(category,'?')
-            FROM wise_tx GROUP BY COALESCE(clean_name,name),COALESCE(category,'?')
+            SELECT COALESCE(clean_name,name), SUM(amount_aud), COUNT(*),
+                   COALESCE(category,'Unknown')
+            FROM wise_tx GROUP BY COALESCE(clean_name,name),COALESCE(category,'Unknown')
             ORDER BY SUM(amount_aud) DESC LIMIT 25
         """)
-        by_recip = cur.fetchall()
+        recips = cur.fetchall()
+        cur.execute("""
+            SELECT date, amount_aud, currency, amount_orig,
+                   COALESCE(clean_name,name), COALESCE(category,'?')
+            FROM wise_tx ORDER BY date DESC LIMIT 30
+        """)
+        recent = cur.fetchall()
 
     bal_text = "\n".join(f"  {b}" for b in bals)
     cat_text = "\n".join(f"  {r[0]}: {float(r[1]):,.2f} AUD ({r[2]})" for r in (s.get("cats") or []))
-    rec_text = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in by_recip)
+    rec_text = "\n".join(f"  {r[0]} [{r[3]}]: {float(r[1]):,.2f} AUD ({r[2]})" for r in recips)
     recent_text = "\n".join(
         f"  {r[0]}: {float(r[1]):,.2f} AUD" +
-        (f" ({float(r[3]):,.2f} {r[2]})" if r[2] != "AUD" else "") +
+        (f" ({float(r[3]):,.2f} {r[2]})" if r[2]!="AUD" else "") +
         f" -> {r[4]} [{r[5]}]"
-        for r in recents)
+        for r in recent)
 
     system = f"""You are the Wise accountant for LeadsPilot — Suleman's SMS lead gen business.
 Answer directly. All amounts in AUD. Times in EST.
 Today: {datetime.now(EST).strftime("%b %d %Y")}
-This month: {s.get("month","")}
 
 BALANCES: {bal_text}
-DB: {s.get("count",0)} transactions ({s.get("oldest","")} to {s.get("newest","")})
-This month total: {s.get("month_total",0):,.2f} AUD
-All time total: {s.get("total",0):,.2f} AUD
+DB: {s.get('count',0)} transactions ({s.get('oldest','')} to {s.get('newest','')})
+This month: {s.get('month_total',0):,.2f} AUD | All time: {s.get('total',0):,.2f} AUD
 
-BY CATEGORY: {cat_text}
-BY RECIPIENT: {rec_text}
-RECENT: {recent_text}"""
+BY CATEGORY:
+{cat_text}
 
-    return claude(q, system, 500) or "Could not answer."
+BY RECIPIENT:
+{rec_text}
+
+RECENT TRANSACTIONS:
+{recent_text}"""
+
+    return claude(q, system) or "Could not answer."
 
 # ── STARTUP ───────────────────────────────────────────────────────────────────
 def startup(client):
     try:
         client.chat_postMessage(channel=CHANNEL_ID,
-            text="_Loading Wise transaction history..._")
+            text="_Wise Bot loading transaction history..._")
         register_webhook()
-        # Load CSV if present
+        # Load CSV
         n = 0
         for path in ["transaction-history.csv", "/app/transaction-history.csv"]:
             if os.path.exists(path):
-                with open(path) as f: n = import_csv(f.read())
+                with open(path,"r") as f: n = import_csv_silent(f.read())
                 break
         s    = get_summary()
         bals = get_balances()
+        oldest = s.get("oldest")
+        newest = s.get("newest")
         msg  = f"*Wise Bot ready* :white_check_mark:\n"
-        msg += f"*{s.get('count',0)} transactions loaded* "
-        if s.get("oldest"): msg += f"({s['oldest']} to {s['newest']})\n"
-        msg += f"*This month:* {s.get('month_total',0):,.2f} AUD\n"
+        msg += f"*{s.get('count',0)} transactions loaded*"
+        if oldest: msg += f" ({oldest} to {newest})"
+        msg += f"\n*This month:* {s.get('month_total',0):,.2f} AUD\n"
         msg += f"*All time:* {s.get('total',0):,.2f} AUD\n"
         msg += "*Balances:*\n" + "\n".join(f"  - {b}" for b in bals)
         if s.get("cats"):
-            msg += "\n\n*All-time by category:*\n"
+            msg += "\n\n*By category (all time):*\n"
             for cat, total, cnt in s["cats"]:
-                msg += f"  - {cat}: {float(total):,.2f} AUD ({cnt})\n"
-        msg += "\nI'll notify you about every new transaction going forward. Ask me anything."
+                msg += f"  - {cat}: {float(total):,.2f} AUD ({cnt} payments)\n"
+        msg += "\nI'll notify you about every new transaction. Ask me anything."
         client.chat_postMessage(channel=CHANNEL_ID, text=msg)
     except Exception as e:
         log.error(f"startup: {e}")
@@ -417,8 +496,7 @@ def worker(client):
         time.sleep(180)
         try:
             new_txs = check_new_transfers()
-            for tx in new_txs:
-                notify_new(tx, client)
+            for tx in new_txs: notify_new(tx, client)
         except Exception as e: log.error(f"worker: {e}")
 
 # ── FLASK ─────────────────────────────────────────────────────────────────────
@@ -430,7 +508,8 @@ def root(): return jsonify({"status":"Wise Bot running"}), 200
 @flask_app.route("/health", methods=["GET"])
 def health():
     s = get_summary()
-    return jsonify({"status":"ok","transactions":s.get("count",0)})
+    return jsonify({"status":"ok","transactions":s.get("count",0),
+                    "month":s.get("month_total",0)})
 
 @flask_app.route("/webhook/wise", methods=["POST","GET"])
 def wise_webhook():
@@ -446,16 +525,6 @@ def wise_webhook():
     except Exception as e:
         log.error(f"webhook: {e}"); return jsonify({"status":"error"}), 500
 
-@flask_app.route("/import-csv", methods=["POST"])
-def import_csv_endpoint():
-    """Upload CSV via HTTP POST to load transaction history."""
-    try:
-        text = request.data.decode("utf-8")
-        n = import_csv(text)
-        return jsonify({"status":"ok","imported":n})
-    except Exception as e:
-        return jsonify({"status":"error","message":str(e)}), 500
-
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False)
 
@@ -465,17 +534,18 @@ slack_app = App(token=SLACK_BOT_TOKEN)
 def process(text, say):
     text = re.sub(r"<@[^>]+>","",text or "").strip()
     if not text: return
-    # Reply about pending transaction
+    # Replying about a pending new transaction
     if _pending:
         for tx_id, tx in list(_pending.items()):
-            info = extract_recipient_info(text, tx["name"], tx["aud"])
-            if info and info.get("category") and info.get("category") != "Unknown":
+            info = extract_info(text, tx["name"], tx["aud"])
+            if info and info.get("category"):
                 clean = info.get("clean_name", tx["name"])
-                cat   = info.get("category")
+                cat   = info.get("category","Unknown")
                 note  = info.get("note","")
-                save_recipient(tx["name"], clean, cat, note)
+                save_known(tx["name"], clean, cat, note)
                 del _pending[tx_id]
-                say(f":white_check_mark: *{clean}* — {cat}" + (f"\n_{note}_" if note else ""))
+                say(f":white_check_mark: *{clean}* — {cat}" +
+                    (f"\n_{note}_" if note else ""))
                 return
     # Accountant question
     say("_Checking..._")
@@ -487,17 +557,18 @@ def on_mention(event, say): process(event.get("text",""), say)
 @slack_app.event("message")
 def on_message(event, say):
     if event.get("bot_id") or event.get("subtype"): return
-    # Handle CSV file uploads in Slack
+    # Handle CSV file dropped in Slack
     for f in event.get("files",[]):
         if f.get("name","").endswith(".csv"):
             url = f.get("url_private") or f.get("url_private_download")
             if url:
-                r = requests.get(url, headers={"Authorization":f"Bearer {SLACK_BOT_TOKEN}"}, timeout=15)
+                r = requests.get(url,
+                    headers={"Authorization":f"Bearer {SLACK_BOT_TOKEN}"}, timeout=15)
                 if r.status_code == 200:
-                    n = import_csv(r.text)
+                    n = import_csv_silent(r.text)
                     s = get_summary()
-                    say(f":white_check_mark: *{n} transactions imported from CSV*\n"
-                        f"Total: {s.get('count',0)} transactions | "
+                    say(f":white_check_mark: *{n} transactions loaded from CSV*\n"
+                        f"Total: {s.get('count',0)} | "
                         f"This month: {s.get('month_total',0):,.2f} AUD | "
                         f"All time: {s.get('total',0):,.2f} AUD")
                 return
